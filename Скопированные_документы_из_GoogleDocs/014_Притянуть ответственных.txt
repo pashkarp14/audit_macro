@@ -1,0 +1,531 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modPopulation_Responsible
+' Версия:    1.0.3  (16.09.2025)
+'
+' Что нового vs 1.0.2:
+'   - Исключены регламентные операции: если в тексте "Документ" встречается слово
+'     с корнем "регламентн" (например, "Регламентная", "регламентные"), номер
+'     операции не извлекается и Ответственный не подтягивается.
+'
+' Назначение:
+'   На листах популяции ("Популяция для тестирования" и части "_Ч1..Ч10")
+'   создать/заполнить колонку "Ответственный", подтянув её из журналов операций
+'   "ЖО" и "ЖО_Ч1..ЖО_ЧN" по номеру операции, который встречается в колонке "Документ":
+'   пример: "Операция 00БП-000002 от 01.01.2024 12:00:00" -> номер "00БП-000002".
+'
+' Производительность:
+'   - Чтение ЖО блоками по двум колонкам -> словарь Номер→Ответственный.
+'   - Популяция: чтение "Документ" массивом и запись "Ответственный" одним присваиванием.
+'   - Без построчных операций/формул/AutoFilter.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.0.3"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' Имена листов популяции
+Private Const POP_BASE        As String = "Популяция для тестирования"
+Private Const POP_PART_SUFFIX As String = "_Ч"
+Private Const POP_MAX_PARTS   As Long = 10
+
+
+' Имена листов ЖО
+Private Const JO_BASE        As String = "ЖО"
+Private Const JO_PART_PREFIX As String = "ЖО_Ч"
+
+
+' Тексты заголовков
+Private Const COL_DOC      As String = "Документ"
+Private Const COL_RESP     As String = "Ответственный"
+Private Const COL_JO_NUM   As String = "Номер"
+Private Const COL_LINKED   As String = "Связанные?"
+
+
+' Локальные переменные шага (для логов)
+Private mStepName As String
+Private mStepT    As Double
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Популяция_Проставить_Ответственных()
+    Dim t0 As Double: t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+
+
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt   = Application.EnableEvents
+    alr   = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents   = False
+    Application.DisplayAlerts  = False
+    Application.Calculation    = xlCalculationManual
+
+
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & _
+            "Популяция_Проставить_Ответственных v" & MODULE_VERSION
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    ' ---------- Сбор ответственных из ЖО ----------
+    StartStep "Сбор ответственных из листов ЖО"
+    Dim joSheets As Collection: Set joSheets = FindJOSheets(wb)
+    Dim dictResp As Object
+    Dim joRows As Long, joFilled As Long, joUnique As Long
+
+
+    If joSheets Is Nothing Or joSheets.Count = 0 Then
+        LogWrite NowStr() & vbTab & "Внимание" & vbTab & "Листы ЖО не найдены (ЖО / ЖО_Ч*)"
+        Set dictResp = Nothing
+    Else
+        Set dictResp = BuildResponsibleDict(joSheets, joRows, joFilled, joUnique)
+        LogWrite NowStr() & vbTab & "? ЖО-итоги" & vbTab & _
+                "Листов=" & joSheets.Count & _
+                "; Строк(прочитано)=" & joRows & _
+                "; С ненул. ответственным=" & joFilled & _
+                "; Уникальных номеров=" & joUnique
+    End If
+    EndStep
+
+
+    ' ---------- Обработка листов популяции ----------
+    StartStep "Проставление 'Ответственный' на листах популяции"
+    Dim popSheets As Collection: Set popSheets = FindPopulationSheets(wb)
+    If popSheets Is Nothing Or popSheets.Count = 0 Then
+        LogWrite NowStr() & vbTab & "Внимание" & vbTab & "Листы популяции не найдены"
+        GoTo FinishOK
+    End If
+
+
+    Dim totalDocs As Long, totalOps As Long, totalSet As Long
+    Dim i As Long
+    For i = 1 To popSheets.Count
+        Dim ws As Worksheet
+        Set ws = popSheets(i)
+        Dim docs As Long, ops As Long, setCnt As Long
+        ProcessPopulationSheet ws, dictResp, docs, ops, setCnt
+        totalDocs = totalDocs + docs
+        totalOps  = totalOps + ops
+        totalSet  = totalSet + setCnt
+
+
+        LogWrite NowStr() & vbTab & "Лист популяции" & vbTab & ws.Name & _
+                "  Документов=" & docs & _
+                "  Найдено операций=" & ops & _
+                "  Проставлено=" & setCnt
+    Next i
+
+
+    LogWrite NowStr() & vbTab & "? Итог по популяции" & vbTab & _
+            "Листов=" & popSheets.Count & _
+            "; Документов всего=" & totalDocs & _
+            "; Найдено операций=" & totalOps & _
+            "; Проставлено ответственных=" & totalSet
+    EndStep
+
+
+FinishOK:
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & _
+            "Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents   = evt
+    Application.DisplayAlerts  = alr
+    Application.Calculation    = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite NowStr() & vbTab & "Ошибка" & vbTab & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'============================== СБОР ДАННЫХ ИЗ ЖО ==============================
+
+
+Private Function FindJOSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection
+    Dim sh As Worksheet, nm As String
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If nm = JO_BASE Or Left$(nm, Len(JO_PART_PREFIX)) = JO_PART_PREFIX Then
+            If FindHeaderCol(sh, COL_JO_NUM, 1) > 0 And FindHeaderCol(sh, COL_RESP, 1) > 0 Then
+                col.Add sh
+            End If
+        End If
+    Next sh
+    Set FindJOSheets = col
+End Function
+
+
+Private Function BuildResponsibleDict( _
+    ByVal joSheets As Collection, _
+    ByRef rowsRead As Long, _
+    ByRef rowsWithResp As Long, _
+    ByRef uniqueKeys As Long) As Object
+
+
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = vbTextCompare
+
+
+    Dim i As Long, ws As Worksheet
+    For i = 1 To joSheets.Count
+        Set ws = joSheets(i)
+
+
+        Dim cNum As Long, cResp As Long
+        cNum  = FindHeaderCol(ws, COL_JO_NUM, 1)
+        cResp = FindHeaderCol(ws, COL_RESP, 1)
+        If cNum = 0 Or cResp = 0 Then GoTo NextSheet
+
+
+        Dim lr As Long: lr = LastDataRowOnCols(ws, Array(cNum, cResp))
+        If lr < 2 Then GoTo NextSheet
+
+
+        Dim aNum As Variant, aResp As Variant
+        aNum  = ws.Range(ws.Cells(2, cNum),  ws.Cells(lr, cNum)).Value2
+        aResp = ws.Range(ws.Cells(2, cResp), ws.Cells(lr, cResp)).Value2
+
+
+        Dim r As Long, key As String, val As String
+        For r = 1 To UBound(aNum, 1)
+            rowsRead = rowsRead + 1
+            key = CleanKey(aNum(r, 1))
+            If LenB(key) = 0 Then GoTo NextR
+            val = Trim$(CStr(aResp(r, 1)))
+            If LenB(val) > 0 Then
+                rowsWithResp = rowsWithResp + 1
+                d(key) = val   ' последнее ненулевое значение побеждает
+            End If
+NextR:
+        Next r
+NextSheet:
+    Next i
+
+
+    uniqueKeys = d.Count
+    Set BuildResponsibleDict = d
+End Function
+
+
+'============================== ОБРАБОТКА ПОПУЛЯЦИИ ============================
+
+
+Private Function FindPopulationSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection
+    Dim sh As Worksheet, nm As String
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If nm = POP_BASE Or Left$(nm, Len(POP_BASE & POP_PART_SUFFIX)) = POP_BASE & POP_PART_SUFFIX Then
+            If FindHeaderCol(sh, COL_DOC, 1) > 0 Then col.Add sh
+        End If
+    Next sh
+    Set FindPopulationSheets = col
+End Function
+
+
+Private Sub ProcessPopulationSheet( _
+    ByVal ws As Worksheet, _
+    ByVal dictResp As Object, _
+    ByRef outDocs As Long, _
+    ByRef outOps As Long, _
+    ByRef outSet As Long)
+
+
+    On Error GoTo SafeExit
+
+
+    ' 1) Позиция вставки: сразу после "Связанные?" (или самый правый конец)
+    Dim cLinked As Long
+    cLinked = FindHeaderCol(ws, COL_LINKED, 1)
+
+
+    Dim lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+
+    Dim insCol As Long
+    If cLinked > 0 Then
+        insCol = cLinked + 1
+    Else
+        insCol = lastCol + 1
+    End If
+
+
+    ' 2) Найдём/создадим/переместим "Ответственный" в insCol
+    Dim cResp As Long
+    cResp = FindHeaderCol(ws, COL_RESP, 1)
+
+
+    If cResp = 0 Then
+        ws.Columns(insCol).Insert
+        ws.Cells(1, insCol).Value = COL_RESP
+        cResp = insCol
+        LogWrite NowStr() & vbTab & ws.Name & vbTab & _
+                 "Создан столбец '" & COL_RESP & "' в кол." & cResp & " (после '" & COL_LINKED & "')"
+    ElseIf cResp <> insCol Then
+        Dim targetCol As Long
+        If cResp < insCol Then
+            targetCol = insCol - 1
+        Else
+            targetCol = insCol
+        End If
+        ws.Columns(cResp).Cut
+        ws.Columns(targetCol).Insert
+        ws.Cells(1, targetCol).Value = COL_RESP
+        cResp = targetCol
+        LogWrite NowStr() & vbTab & ws.Name & vbTab & _
+                 "Перемещён столбец '" & COL_RESP & "' в кол." & cResp & " (после '" & COL_LINKED & "')"
+    Else
+        Dim lrClear As Long
+        lrClear = LastDataRow2(ws)
+        If lrClear >= 2 Then
+            ws.Range(ws.Cells(2, cResp), ws.Cells(lrClear, cResp)).ClearContents
+        End If
+        LogWrite NowStr() & vbTab & ws.Name & vbTab & _
+                 "Очищен столбец '" & COL_RESP & "' для перезаполнения"
+    End If
+    ws.Columns(cResp).NumberFormat = "@"
+
+
+    ' 3) Теперь находим "Документ"
+    Dim cDoc As Long
+    cDoc = FindHeaderCol(ws, COL_DOC, 1)
+    If cDoc = 0 Then
+        LogWrite NowStr() & vbTab & "Пропуск (нет '" & COL_DOC & "')" & vbTab & ws.Name
+        Exit Sub
+    End If
+
+
+    LogWrite NowStr() & vbTab & ws.Name & vbTab & _
+             "Позиции: Документ=" & cDoc & "; Связанные?=" & IIf(cLinked > 0, CStr(cLinked), "нет") & _
+             "; Ответственный=" & cResp
+
+
+    ' 4) Заполняем
+    Dim lr As Long
+    lr = LastDataRow2(ws)
+    If lr < 2 Then Exit Sub
+
+
+    Dim aDoc As Variant
+    aDoc = ws.Range(ws.Cells(2, cDoc), ws.Cells(lr, cDoc)).Value2
+
+
+    Dim n As Long
+    n = UBound(aDoc, 1)
+
+
+    Dim aOut() As Variant
+    ReDim aOut(1 To n, 1 To 1)
+
+
+    Dim i As Long
+    Dim s As String
+    Dim num As String
+    Dim setCnt As Long
+    Dim opsCnt As Long
+
+
+    For i = 1 To n
+        s = CStr(aDoc(i, 1))
+        If LenB(s) > 0 Then
+            num = ExtractOperationNumber(s)
+            If LenB(num) > 0 Then
+                opsCnt = opsCnt + 1
+                If Not dictResp Is Nothing Then
+                    If dictResp.Exists(num) Then
+                        aOut(i, 1) = dictResp(num)
+                        setCnt = setCnt + 1
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+
+    ws.Range(ws.Cells(2, cResp), ws.Cells(lr, cResp)).Value = aOut
+
+
+    outDocs = n
+    outOps  = opsCnt
+    outSet  = setCnt
+
+
+SafeExit:
+End Sub
+
+
+'============================== ПАРСИНГ НОМЕРА ОПЕРАЦИИ ========================
+
+
+Private Function ExtractOperationNumber(ByVal s As String) As String
+    ' Ищем слово "операция" и берём ближайший токен после него, содержащий хотя бы одну цифру.
+    ' Доп. условие: если в тексте встречается "регламентн*", пропускаем (регламентные операции).
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+
+
+    ' Отсекаем регламентные операции ("Регламентная", "регламентные" и т.п.)
+    If InStr(1, s, "регламентн", vbTextCompare) > 0 Then Exit Function
+
+
+    Dim p As Long
+    p = InStr(1, s, "операция", vbTextCompare)
+    If p = 0 Then Exit Function
+
+
+    Dim i As Long, j As Long, ch As String
+    i = p + Len("операция")
+
+
+    Do While i <= Len(s)
+        ch = Mid$(s, i, 1)
+        If ch <> " " And ch <> ":" And ch <> "-" And ch <> "=" And ch <> vbTab Then Exit Do
+        i = i + 1
+    Loop
+    If i > Len(s) Then Exit Function
+
+
+    j = i
+    Do While j <= Len(s)
+        ch = Mid$(s, j, 1)
+        If ch = " " Or ch = vbTab Or ch = vbCr Or ch = vbLf Or ch = "," Or ch = ";" Then Exit Do
+        j = j + 1
+    Loop
+
+
+    Dim tok As String
+    tok = Trim$(Mid$(s, i, j - i))
+
+
+    If LenB(tok) = 0 Then Exit Function
+    If LCase$(tok) = "от" Then Exit Function
+    If Not ContainsDigit(tok) Then Exit Function
+
+
+    ExtractOperationNumber = CleanKey(tok)
+End Function
+
+
+Private Function ContainsDigit(ByVal s As String) As Boolean
+    Dim k As Long, c As Integer
+    For k = 1 To Len(s)
+        c = AscW(Mid$(s, k, 1))
+        If c >= 48 And c <= 57 Then
+            ContainsDigit = True
+            Exit Function
+        End If
+    Next k
+End Function
+
+
+'============================== ХЕЛПЕРЫ ДЛЯ ТАБЛИЦ =============================
+
+
+Private Function CleanKey(ByVal v As Variant) As String
+    Dim s As String
+    s = Trim$(CStr(v))
+    If LenB(s) = 0 Then Exit Function
+    s = Replace$(s, Chr$(160), " ")
+    CleanKey = Trim$(s)
+End Function
+
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal hdrRow As Long) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If CStr(ws.Cells(hdrRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Function LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long, j As Long, c As Long, lrj As Long
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    LastDataRowOnCols = lr
+End Function
+
+
+Private Function LastDataRow2(ByVal ws As Worksheet) As Long
+    Dim lastCol As Long, c As Long, lr As Long, l As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        l = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If l > lr Then lr = l
+    Next c
+    If lr < 2 Then lr = 2
+    LastDataRow2 = lr
+End Function
+
+
+'============================== ЛОГИ/ШАГИ ======================================
+
+
+Private Sub StartStep(ByVal stepName As String)
+    mStepName = stepName
+    mStepT = Timer
+    LogWrite NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    If LenB(mStepName) > 0 Then
+        LogWrite NowStr() & vbTab & "<< " & mStepName & "  (" & Format$(Timer - mStepT, "0.00") & " сек)"
+    End If
+    mStepName = vbNullString
+    mStepT = 0
+End Sub
+
+
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

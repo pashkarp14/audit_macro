@@ -1,0 +1,588 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+'  Модуль:   modPopulate_Holidays
+'  Версия:   1.2.0  (22.09.2025)
+'
+'  Что нового vs 1.1.0:
+'    - Эталонный механизм источников: берём ИЛИ базовый лист, ИЛИ части "_Ч…", но не вместе.
+'    - Индексы колонок для условий определяются на КАЖДОМ листе по его шапке.
+'    - Данные мэппятся ПО ИМЕНАМ шапки образца (лист-первый из популяции); если на листе
+'      нет нужной колонки — в вывод пишется пусто (структура/порядок колонок стабильны).
+'    - Добавлена защита: строки, помеченные этим же тестом в "Протестировано?", не отсекаются
+'      (см. INCLUDE_OWN_MARKED + OWN_TEST_LABEL; функция PH_ДопускПоСвоейМетки).
+'    - Убрано копирование ширин колонок; оставляем шапку и NumberFormatLocal.
+'
+'  Назначение:
+'    Сформировать популяцию для теста "Праздничные дни":
+'      - Источник: "Популяция для тестирования" ИЛИ "Популяция для тестирования_Ч*".
+'      - Берём строки, где Дата ? списку праздников (лист "Производственный календарь 2024", кол.1).
+'      - Исключаем строки, где "Протестировано?" НЕ пусто, КРОМЕ случаев собственной метки теста.
+'      - Шапка/форматы — как на первом листе-источнике; данные — массивами (быстро).
+'      - При переполнении — создаём дополнительные листы "Популяция праздники", "_Ч1", "_Ч2", ...
+'
+'  Примечание по форматам:
+'    Шапка — точные форматы; данные — NumberFormatLocal по колонкам. Ширины колонок не копируем.
+'===============================================================================
+
+
+Private Const MacroVersion        As String = "1.2.0"
+Private Const LOG_SHEET           As String = "Логи"
+
+
+' Источники (популяция)
+Private Const POP_BASE            As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF       As String = "_Ч"
+
+
+' Лист с праздничными датами
+Private Const SHEET_HOL_CAL       As String = "Производственный календарь 2024"
+Private Const HOL_COL             As Long = 1
+
+
+' Целевые листы
+Private Const DST_BASE            As String = "Популяция праздники"
+
+
+' Якорь/шапка — строка 1
+Private Const HEADER_ROW          As Long = 1
+
+
+' Лимиты и форматы
+Private Const MAX_ROWS_PER_SHEET  As Long = 1000000
+Private Const NUM_FMT_FALLBACK    As String = "General"
+
+
+' Метка именно ЭТОГО теста + политика допуска
+Private Const OWN_TEST_LABEL      As String = "См. праздники"
+Private Const INCLUDE_OWN_MARKED  As Boolean = True
+
+
+' Логи шагов
+Private currentStep As String
+Private stepT As Double
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Сформировать_Популяцию_Праздники()
+    
+    Dim t0 As Double: t0 = Timer
+
+
+    Dim appCalc As XlCalculation: appCalc = Application.Calculation
+    Dim scrUp As Boolean:          scrUp = Application.ScreenUpdating
+    Dim evt As Boolean:            evt = Application.EnableEvents
+    Dim alr As Boolean:            alr = Application.DisplayAlerts
+
+
+    On Error GoTo EH
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite PH_NowStr() & vbTab & "Старт" & vbTab & "Сформировать_Популяцию_Праздники v" & MacroVersion
+    LogWrite "Условия: Дата ? праздникам; Tested пусто " & _
+            IIf(INCLUDE_OWN_MARKED, "ИЛИ содержит '" & OWN_TEST_LABEL & "'", "(без учёта своей метки)")
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    ' ---------- 1) Список праздничных дат ----------
+    StartStep "Чтение списка праздничных дат"
+    Dim holSet As Object: Set holSet = CreateObject("Scripting.Dictionary"): holSet.CompareMode = vbTextCompare
+
+
+    Dim wsHol As Worksheet: Set wsHol = wb.Worksheets(SHEET_HOL_CAL)
+    Dim lastHol As Long:    lastHol = wsHol.Cells(wsHol.rows.count, HOL_COL).End(xlUp).Row
+
+
+    Dim arrHol As Variant, r As Long, key As String, cntHol As Long
+    If lastHol >= 1 Then
+        arrHol = wsHol.Range(wsHol.Cells(1, HOL_COL), wsHol.Cells(lastHol, HOL_COL)).Value2
+        For r = 1 To UBound(arrHol, 1)
+            key = PH_ToDateKey(arrHol(r, 1))
+            If LenB(key) > 0 Then If Not holSet.Exists(key) Then holSet.Add key, True: cntHol = cntHol + 1
+        Next r
+    End If
+    LogWrite PH_NowStr() & vbTab & "? Праздничных дат (уник.)" & vbTab & cntHol
+    If cntHol = 0 Then GoTo FinishOK
+    EndStep
+
+
+    ' ---------- 2) Листы популяции ----------
+    StartStep "Поиск листов популяции (base ИЛИ parts)"
+    Dim popSheets As Collection: Set popSheets = PH_GetPopulationSheets_Ethalon(wb)
+    If popSheets Is Nothing Or popSheets.count = 0 Then
+        LogWrite PH_NowStr() & vbTab & "Внимание" & vbTab & "Листы популяции не найдены"
+        GoTo FinishOK
+    End If
+    LogWrite PH_NowStr() & vbTab & "Найдено листов популяции" & vbTab & popSheets.count
+    EndStep
+
+
+    ' ---------- 3) Опорная шапка/образец ----------
+    StartStep "Определение шапки образца и подготовка приёмника"
+    Dim wsSample As Worksheet: Set wsSample = popSheets(1)
+
+
+    Dim outCols As Long
+    outCols = wsSample.Cells(HEADER_ROW, wsSample.Columns.count).End(xlToLeft).Column
+
+
+    ' Имена шапки образца (для мэппинга по листам)
+    Dim keepHdrNames() As String, j As Long
+    ReDim keepHdrNames(1 To outCols)
+    For j = 1 To outCols
+        keepHdrNames(j) = CStr(wsSample.Cells(HEADER_ROW, j).Value)
+    Next j
+
+
+    ' Приёмник: создаём/очищаем первый лист, копируем шапку + её форматы (ширины НЕ копируем)
+    Dim dst As Worksheet, dstIndex As Long: dstIndex = 0
+    Set dst = PH_PrepareDstSheet(wb, dstIndex, wsSample, outCols)
+
+
+    ' Для NumberFormatLocal данных берём форматы со второй строки образца, если есть
+    Dim fmtByCol() As String
+    ReDim fmtByCol(1 To outCols)
+    Dim lrSample As Long: lrSample = PH_LastDataRowOnCols(wsSample, Array(1))
+    For j = 1 To outCols
+        fmtByCol(j) = IIf(lrSample >= 2, wsSample.Cells(2, j).NumberFormatLocal, NUM_FMT_FALLBACK)
+        If Len(fmtByCol(j)) = 0 Then fmtByCol(j) = NUM_FMT_FALLBACK
+        On Error Resume Next
+        dst.Columns(j).NumberFormatLocal = fmtByCol(j)
+        On Error GoTo 0
+    Next j
+    EndStep
+
+
+    ' ---------- 4) Основной проход: отбор + мэппинг по именам ----------
+    StartStep "Отбор строк и запись чанками (мэппинг по именам шапки)"
+    Dim rowsWritten As Long: rowsWritten = 0
+
+
+    Dim buf() As Variant, bufCap As Long, bufLen As Long
+    bufCap = 200000
+    ReDim buf(1 To bufCap, 1 To outCols)
+    bufLen = 0
+
+
+    Dim writeRow As Long: writeRow = 2 ' на приёмнике: 1 — шапка
+    Dim i As Long
+    For i = 1 To popSheets.count
+        Dim ws As Worksheet: Set ws = popSheets(i)
+
+
+        ' Индексы условий — на КАЖДОМ листе
+        Dim colDate As Long, colTested As Long
+        Dim hdrDate As String, hdrTested As String
+
+
+        colDate = PH_FindHeaderSyn(ws, Array("Дата", " дата", "дата ", "Дата операции", "Дата проводки"), HEADER_ROW, hdrDate)
+        If colDate = 0 Then
+            LogWrite PH_NowStr() & vbTab & "Пропуск листа (нет 'Дата')" & vbTab & ws.name
+            GoTo NextSheet
+        End If
+        colTested = PH_FindHeaderSyn(ws, Array("Протестировано?", " протестировано?", "протестировано? ", "Протестировано", " протестировано", "протестировано "), HEADER_ROW, hdrTested)
+
+
+        ' Блок данных текущего листа
+        Dim maxC As Long: maxC = ws.Cells(HEADER_ROW, ws.Columns.count).End(xlToLeft).Column
+        Dim lr As Long: lr = PH_LastDataRowOnCols(ws, Array(colDate, IIf(colTested > 0, colTested, colDate)))
+        If lr < 2 Then GoTo NextSheet
+
+
+        Dim block As Variant
+        block = ws.Range(ws.Cells(1, 1), ws.Cells(lr, maxC)).Value2
+
+
+        ' Карта шапки этого листа: имя(норм.) -> колонка
+        Dim hdrMap As Object: Set hdrMap = PH_BuildHeaderIndex(ws, HEADER_ROW)
+
+
+        Dim rr As Long, pickedOnSheet As Long: pickedOnSheet = 0
+        For rr = 2 To lr
+            ' Фильтр по дате
+            Dim k As String: k = PH_ToDateKey(block(rr, colDate))
+            If LenB(k) = 0 Then GoTo NextR
+            If Not holSet.Exists(k) Then GoTo NextR
+
+
+            ' Фильтр по "Протестировано?"
+            If colTested > 0 Then
+                If Not PH_ДопускПоСвоейМетки(block(rr, colTested), INCLUDE_OWN_MARKED, OWN_TEST_LABEL) Then GoTo NextR
+            End If
+
+
+            ' Сбор строки с мэппингом по именам шапки образца
+            Dim wantHdr As String, wantKey As String, srcC As Long, rel As Long
+            bufLen = bufLen + 1
+            For j = 1 To outCols
+                wantHdr = keepHdrNames(j)
+                wantKey = PH_NormalizeHeaderText(wantHdr)
+                If hdrMap.Exists(wantKey) Then
+                    srcC = CLng(hdrMap(wantKey))
+                    rel = srcC ' block уже от 1..maxC
+                    If rel <= UBound(block, 2) Then
+                        buf(bufLen, j) = block(rr, rel)
+                    Else
+                        buf(bufLen, j) = Empty
+                    End If
+                Else
+                    buf(bufLen, j) = Empty
+                End If
+            Next j
+            pickedOnSheet = pickedOnSheet + 1
+
+
+            If bufLen = bufCap Then
+                Call PH_FlushBufferSmart(wb, dst, ws, dstIndex, buf, bufLen, writeRow, outCols, rowsWritten, wsSample)
+            End If
+NextR:
+        Next rr
+
+
+        LogWrite PH_NowStr() & vbTab & "Источник обработан" & vbTab & ws.name & _
+                "  Дата=c" & colDate & _
+                "  Протестировано?=" & IIf(colTested > 0, "c" & colTested, "нет") & _
+                "  Отобрано на этом листе=" & pickedOnSheet & _
+                "  Всего записано (кум.)=" & (rowsWritten + bufLen)
+NextSheet:
+    Next i
+
+
+    ' Финальная выгрузка остатка
+    If bufLen > 0 Then
+        Call PH_FlushBufferSmart(wb, dst, popSheets(popSheets.count), dstIndex, buf, bufLen, writeRow, outCols, rowsWritten, wsSample)
+    End If
+
+
+    LogWrite PH_NowStr() & vbTab & "? ИТОГ" & vbTab & "Всего записано строк=" & rowsWritten
+    EndStep
+
+
+FinishOK:
+    LogWrite PH_NowStr() & vbTab & "Готово" & vbTab & "Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite PH_NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'============================== ВЫГРУЗКА/РАЗБИЕНИЕ =============================
+
+
+' Умная выгрузка буфера с учётом лимита MAX_ROWS_PER_SHEET.
+' При необходимости создаёт следующий лист приёмника и продолжает запись.
+Private Sub PH_FlushBufferSmart( _
+    ByVal wb As Workbook, _
+    ByRef dst As Worksheet, _
+    ByVal sampleWs As Worksheet, _
+    ByRef dstIndex As Long, _
+    ByRef buf() As Variant, _
+    ByRef bufLen As Long, _
+    ByRef writeRow As Long, _
+    ByVal outCols As Long, _
+    ByRef rowsWritten As Long, _
+    ByVal wsSample As Worksheet)
+
+
+    Dim remaining As Long: remaining = bufLen
+
+
+    Do While remaining > 0
+        Dim rowsFree As Long
+        rowsFree = MAX_ROWS_PER_SHEET - (writeRow - 1)
+
+
+        If rowsFree <= 0 Then
+            Set dst = PH_PrepareDstSheet(wb, dstIndex, wsSample, outCols)
+            writeRow = 2
+            rowsFree = MAX_ROWS_PER_SHEET
+        End If
+
+
+        Dim chunk As Long
+        chunk = IIf(remaining <= rowsFree, remaining, rowsFree)
+
+
+        Dim r0 As Long, r1 As Long
+        r0 = writeRow
+        r1 = writeRow + chunk - 1
+
+
+        Dim rng As Range
+        Set rng = dst.Range(dst.Cells(r0, 1), dst.Cells(r1, outCols))
+
+
+        If chunk = bufLen Then
+            rng.Value = buf
+        Else
+            Dim tmp() As Variant, i As Long, j As Long
+            ReDim tmp(1 To chunk, 1 To outCols)
+            For i = 1 To chunk
+                For j = 1 To outCols
+                    tmp(i, j) = buf(i, j)
+                Next j
+            Next i
+            rng.Value = tmp
+
+
+            ' Сместим остаток буфера в начало
+            Dim remainAfter As Long: remainAfter = remaining - chunk
+            If remainAfter > 0 Then
+                For i = 1 To remainAfter
+                    For j = 1 To outCols
+                        buf(i, j) = buf(chunk + i, j)
+                    Next j
+                Next i
+            End If
+        End If
+
+
+        writeRow = r1 + 1
+        rowsWritten = rowsWritten + chunk
+        remaining = remaining - chunk
+        bufLen = remaining
+
+
+        LogWrite PH_NowStr() & vbTab & "Flush" & vbTab & dst.name & _
+                "  chunk=" & chunk & "  writeRowNext=" & writeRow & "  totalWritten=" & rowsWritten
+    Loop
+End Sub
+
+
+'============================== ПОДГОТОВКА ПРИЁМНИКА ===========================
+
+
+Private Function PH_PrepareDstSheet(ByVal wb As Workbook, ByRef dstIndex As Long, ByVal wsSample As Worksheet, ByVal outCols As Long) As Worksheet
+    Dim nameCandidate As String
+    If dstIndex = 0 Then
+        nameCandidate = DST_BASE
+    Else
+        nameCandidate = DST_BASE & "_" & "Ч" & CStr(dstIndex)
+    End If
+
+
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(nameCandidate)
+    On Error GoTo 0
+
+
+    If ws Is Nothing Then
+        Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.count))
+        ws.name = nameCandidate
+    Else
+        ws.Cells.Clear
+    End If
+
+
+    ' Шапка: значения + форматы (ширины НЕ копируем)
+    Dim c As Long
+    For c = 1 To outCols
+        ws.Cells(1, c).Value = wsSample.Cells(HEADER_ROW, c).Value
+        wsSample.Cells(HEADER_ROW, c).Copy
+        ws.Cells(1, c).PasteSpecial xlPasteFormats
+    Next c
+    Application.CutCopyMode = False
+
+
+    dstIndex = dstIndex + 1
+    LogWrite PH_NowStr() & vbTab & "Создан/очищен приёмник" & vbTab & ws.name & "  Колонок=" & outCols
+    Set PH_PrepareDstSheet = ws
+End Function
+
+
+'============================== HELPERS: ПОИСК/ТЕКСТ ===========================
+
+
+' Эталон: либо базовый лист, либо все части "_Ч…"
+Private Function PH_GetPopulationSheets_Ethalon(ByVal wb As Workbook) As Collection
+    Dim col As New Collection, sh As Worksheet, foundBase As Boolean
+    For Each sh In wb.Worksheets
+        If sh.name = POP_BASE Then
+            col.Add sh
+            foundBase = True
+            Exit For
+        End If
+    Next sh
+    If foundBase Then
+        Set PH_GetPopulationSheets_Ethalon = col
+        Exit Function
+    End If
+    For Each sh In wb.Worksheets
+        If Left$(sh.name, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+    Set PH_GetPopulationSheets_Ethalon = col
+End Function
+
+
+' Карта шапки: нормализованное имя -> индекс колонки
+Private Function PH_BuildHeaderIndex(ByVal ws As Worksheet, ByVal hdrRow As Long) As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.count).End(xlToLeft).Column
+    Dim c As Long, key As String, raw As String
+    For c = 1 To lastCol
+        raw = CStr(ws.Cells(hdrRow, c).Value)
+        key = PH_NormalizeHeaderText(raw)
+        If Len(key) > 0 Then If Not dict.Exists(key) Then dict.Add key, c
+    Next c
+    Set PH_BuildHeaderIndex = dict
+End Function
+
+
+Private Function PH_FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant, ByVal hdrRow As Long, ByRef foundHeader As String) As Long
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.count).End(xlToLeft).Column
+    Dim j As Long, i As Long, head As String, key As String
+    foundHeader = vbNullString
+    For j = 1 To lastCol
+        head = PH_NormalizeHeaderText(CStr(ws.Cells(hdrRow, j).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                key = PH_NormalizeHeaderText(CStr(syns(i)))
+                If head = key Then
+                    foundHeader = CStr(ws.Cells(hdrRow, j).Value)
+                    PH_FindHeaderSyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+End Function
+
+
+Private Function PH_LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long, j As Long, lrj As Long, c As Long
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.rows.count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    PH_LastDataRowOnCols = lr
+End Function
+
+
+Private Function PH_NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    PH_NormalizeHeaderText = s
+End Function
+
+
+Private Function PH_IsEmptyOrTrimEmpty(ByVal v As Variant) As Boolean
+    Dim s As String
+    If IsEmpty(v) Then PH_IsEmptyOrTrimEmpty = True: Exit Function
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    s = Trim$(s)
+    PH_IsEmptyOrTrimEmpty = (LenB(s) = 0)
+End Function
+
+
+' Допуск по своей метке: True, если Tested пусто
+'   или (если includeOwn=True) Tested содержит ownLabel (без учёта регистра/пробелов)
+Private Function PH_ДопускПоСвоейМетки(ByVal v As Variant, ByVal includeOwn As Boolean, ByVal ownLabel As String) As Boolean
+    If PH_IsEmptyOrTrimEmpty(v) Then
+        PH_ДопускПоСвоейМетки = True
+        Exit Function
+    End If
+    If includeOwn Then
+        Dim s As String
+        On Error Resume Next: s = CStr(v): On Error GoTo 0
+        s = Trim$(s)
+        If LenB(s) > 0 Then
+            If InStr(1, s, ownLabel, vbTextCompare) > 0 Then
+                PH_ДопускПоСвоейМетки = True
+                Exit Function
+            End If
+        End If
+    End If
+End Function
+
+
+' Ключ даты "dd.mm.yyyy" из значения
+Private Function PH_ToDateKey(ByVal v As Variant) As String
+    On Error GoTo Fallback
+    If IsError(v) Then Exit Function
+    If IsNumeric(v) And val(v) > 0 Then
+        PH_ToDateKey = Format$(CDate(v), "dd.mm.yyyy")
+        Exit Function
+    End If
+    Dim s As String: s = Trim$(CStr(v))
+    If LenB(s) = 0 Then Exit Function
+    If Len(s) = 10 And Mid$(s, 3, 1) = "." And Mid$(s, 6, 1) = "." Then
+        If IsDate(s) Then PH_ToDateKey = Format$(CDate(s), "dd.mm.yyyy"): Exit Function
+    End If
+    If IsDate(s) Then PH_ToDateKey = Format$(CDate(s), "dd.mm.yyyy")
+    Exit Function
+Fallback:
+    PH_ToDateKey = ""
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.rows.count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite PH_NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite PH_NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function PH_NowStr() As String
+    PH_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

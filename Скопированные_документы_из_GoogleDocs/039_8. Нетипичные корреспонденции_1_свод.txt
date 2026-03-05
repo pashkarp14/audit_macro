@@ -1,0 +1,533 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modNTRC_Fill
+' Версия:    1.0.0  (18.09.2025)
+'
+' Назначение:
+'   Заполнить лист "8. Нетипичные корреспонденции" данными из
+'   "2. Проводки к исключению" (только строки с Меппинг = "Популяция для тестирования").
+'
+' Ключевые правила:
+'   • Приёмник: лист "8. Нетипичные корреспонденции"
+'       - Во 2-м столбце ищем якорь "Свод всех проводок>>>"
+'       - Под якорем (row+1) — шапка: "Проводка", "Сумма", "Комментарий"
+'       - Низ области — первая ячейка "Итого" в том же 2-м столбце ниже шапки
+'       - Между шапкой и "Итого" — область вставки
+'   • Источник: лист "2. Проводки к исключению"
+'       - Во 2-м столбце ищем якорь "Анализ проводок к исключению>>>"
+'       - Под якорем шапка: "Проводка", "Дт", "Кт", "Сумма", "Сумма абс", "Меппинг", "Обоснование к исключению"
+'       - Копируем ТОЛЬКО строки, где "Меппинг" = "Популяция для тестирования"
+'       - В приёмник переносим "Проводка" и "Сумма"; "Комментарий" оставляем пустым
+'   • Формат/рамки:
+'       - Перед вставкой очищаем ВСЕ внутренние границы в области вставки
+'       - После вставки обводим вставленные строки ОДНОЙ толстой внешней рамкой
+'       - Под колонкой "Сумма" (на строке "Итого") — формула суммы вставленных значений
+'
+' Оптимизация:
+'   • Без AutoFilter; читаем через массивы Variant; один проход по данным
+'   • Минимум обращения к листу; блоковые операции
+'
+' Логи:
+'   • Детальные шаги/кол-ва, найденные адреса, итог по строкам/формулам/рамкам
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.0.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' ---------------- Константы приёмника ----------------
+Private Const DST_SHEET       As String = "8. Нетипичные корреспонденции"
+Private Const DST_ANCHOR_COL  As Long = 2
+Private Const DST_ANCHOR_TEXT As String = "Свод всех проводок>>>"
+Private Const TOTAL_TEXT      As String = "Итого"
+
+
+' ---------------- Константы источника ----------------
+Private Const SRC_SHEET       As String = "2. Проводки к исключению"
+Private Const SRC_ANCHOR_COL  As Long = 2
+Private Const SRC_ANCHOR_TEXT As String = "Анализ проводок к исключению>>>"
+Private Const MAPPING_NEEDLE  As String = "Популяция для тестирования"
+
+
+' ---------------- Прогресс-чанки ----------------
+Private Const PROGRESS_BUILD  As Long = 100000
+
+
+' Временные переменные для шагов
+Private curStep As String
+Private stepT As Double
+
+
+'========================================================================================
+' ПУБЛИЧНАЯ ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Заполнить_Нетипичные_Корреспонденции()
+    Dim t0 As Double: t0 = Timer
+    NTC_LogWrite "Старт Заполнить_Нетипичные_Корреспонденции v" & MODULE_VERSION
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+
+
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    '==================== 1) Приёмник: зона вставки ====================
+    NTC_StartStep "Приёмник: поиск якоря/границ"
+    Dim wsDst As Worksheet
+    Set wsDst = ThisWorkbook.Worksheets(DST_SHEET)
+
+
+    Dim dstAnchorRow As Long
+    dstAnchorRow = NTC_FindAnchorRow(wsDst, DST_ANCHOR_COL, DST_ANCHOR_TEXT)
+    If dstAnchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & DST_ANCHOR_TEXT & "' на листе '" & DST_SHEET & "'."
+
+
+    Dim dstHdrRow As Long, dstDataTop As Long, dstTotalRow As Long, dstDataBottom As Long
+    dstHdrRow = dstAnchorRow + 1
+    dstDataTop = dstHdrRow + 1
+    dstTotalRow = NTC_FindBelowExact(wsDst, DST_ANCHOR_COL, TOTAL_TEXT, dstDataTop)
+    If dstTotalRow = 0 Or dstTotalRow <= dstDataTop Then Err.Raise 5, , "Не найдена строка 'Итого' на приёмнике."
+
+
+    dstDataBottom = dstTotalRow - 1
+
+
+    ' Определяем колонки приёмника по названиям шапки
+    Dim dstHdrMap As Object
+    Set dstHdrMap = NTC_BuildHeaderMap(wsDst, dstHdrRow)
+
+
+    Dim dstColDoc As Long, dstColAmt As Long, dstColCmt As Long
+    dstColDoc = NTC_FindHeader(dstHdrMap, Array("проводка"))
+    dstColAmt = NTC_FindHeader(dstHdrMap, Array("сумма"))
+    dstColCmt = NTC_FindHeader(dstHdrMap, Array("комментарий", "примечание", "коммент"))
+
+
+    If dstColDoc = 0 Or dstColAmt = 0 Or dstColCmt = 0 Then
+        Err.Raise 5, , "Не найдены все столбцы шапки приёмника (Проводка/Сумма/Комментарий)."
+    End If
+
+
+    Dim dstFirstCol As Long, dstLastCol As Long
+    dstFirstCol = Application.WorksheetFunction.Min(dstColDoc, dstColAmt, dstColCmt)
+    dstLastCol = Application.WorksheetFunction.Max(dstColDoc, dstColAmt, dstColCmt)
+
+
+    NTC_LogWrite "? Приёмник: AnchorRow=" & dstAnchorRow & "; HeaderRow=" & dstHdrRow & "; DataTop=" & dstDataTop & "; TotalRow=" & dstTotalRow
+    NTC_EndStep
+
+
+    '==================== 2) Источник: сбор данных ====================
+    NTC_StartStep "Источник: поиск якоря/шапки/данных"
+    Dim wsSrc As Worksheet
+    Set wsSrc = ThisWorkbook.Worksheets(SRC_SHEET)
+
+
+    Dim srcAnchorRow As Long
+    srcAnchorRow = NTC_FindAnchorRow(wsSrc, SRC_ANCHOR_COL, SRC_ANCHOR_TEXT)
+    If srcAnchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & SRC_ANCHOR_TEXT & "' на листе '" & SRC_SHEET & "'."
+
+
+    Dim srcHdrRow As Long, srcDataTop As Long, srcDataBottom As Long
+    srcHdrRow = srcAnchorRow + 1
+    srcDataTop = srcHdrRow + 1
+
+
+    ' Низ источника — первая "Итого" ниже; если нет — последняя непустая по колонке "Проводка" или "Сумма"
+    Dim srcHdrMap As Object
+    Set srcHdrMap = NTC_BuildHeaderMap(wsSrc, srcHdrRow)
+
+
+    Dim srcColDoc As Long, srcColAmt As Long, srcColMap As Long
+    srcColDoc = NTC_FindHeader(srcHdrMap, Array("проводка"))
+    srcColAmt = NTC_FindHeader(srcHdrMap, Array("сумма"))
+    srcColMap = NTC_FindHeader(srcHdrMap, Array("меппинг", "mapping"))
+
+
+    If srcColDoc = 0 Or srcColAmt = 0 Or srcColMap = 0 Then
+        Err.Raise 5, , "В источнике не найдены столбцы Проводка/Сумма/Меппинг."
+    End If
+
+
+    Dim srcTotalRow As Long
+    srcTotalRow = NTC_FindBelowExact(wsSrc, SRC_ANCHOR_COL, TOTAL_TEXT, srcDataTop)
+    If srcTotalRow = 0 Then
+        ' Фолбэк — по последней строке в колонке "Сумма" либо "Проводка"
+        srcDataBottom = Application.WorksheetFunction.Max( _
+            NTC_LastDataRow(wsSrc, srcColAmt), _
+            NTC_LastDataRow(wsSrc, srcColDoc))
+    Else
+        srcDataBottom = srcTotalRow - 1
+    End If
+
+
+    If srcDataBottom < srcDataTop Then
+        NTC_LogWrite "Источник пуст ниже шапки. Будет очищена область приёмника."
+    End If
+
+
+    NTC_LogWrite "? Источник: AnchorRow=" & srcAnchorRow & "; HeaderRow=" & srcHdrRow & "; DataTop=" & srcDataTop & "; DataBottom=" & srcDataBottom
+    NTC_EndStep
+
+
+    '==================== 3) Фильтрация по Меппинг и сбор массивов ====================
+    NTC_StartStep "Фильтрация: Меппинг = '" & MAPPING_NEEDLE & "'"
+
+
+    Dim rngDoc As Range, rngAmt As Range, rngMap As Range
+    If srcDataBottom >= srcDataTop Then
+        Set rngDoc = wsSrc.Range(wsSrc.Cells(srcDataTop, srcColDoc), wsSrc.Cells(srcDataBottom, srcColDoc))
+        Set rngAmt = wsSrc.Range(wsSrc.Cells(srcDataTop, srcColAmt), wsSrc.Cells(srcDataBottom, srcColAmt))
+        Set rngMap = wsSrc.Range(wsSrc.Cells(srcDataTop, srcColMap), wsSrc.Cells(srcDataBottom, srcColMap))
+    End If
+
+
+    Dim vDoc As Variant, vAmt As Variant, vMap As Variant
+    Dim nSrc As Long
+    If Not rngDoc Is Nothing Then
+        vDoc = rngDoc.Value2
+        vAmt = rngAmt.Value2
+        vMap = rngMap.Value2
+        nSrc = UBound(vDoc, 1)
+    Else
+        nSrc = 0
+    End If
+
+
+    Dim i As Long, cnt As Long
+    Dim needle As String
+    needle = LCase$(Trim$(MAPPING_NEEDLE))
+
+
+    ' Первый проход — посчитать
+    If nSrc > 0 Then
+        For i = 1 To nSrc
+            If LCase$(Trim$(CStr(vMap(i, 1)))) = needle Then
+                cnt = cnt + 1
+            End If
+            If (i Mod PROGRESS_BUILD) = 0 Then
+                NTC_LogWrite "... просмотрено строк: " & i & "; подходящих: " & cnt
+            End If
+        Next i
+    End If
+
+
+    ' Готовим выходной массив 3 колонки: [Проводка, Сумма, Комментарий(пусто)]
+    Dim outRows As Long: outRows = cnt
+    Dim outArr As Variant
+    If outRows > 0 Then
+        ReDim outArr(1 To outRows, 1 To 3)
+        Dim j As Long: j = 0
+        For i = 1 To nSrc
+            If LCase$(Trim$(CStr(vMap(i, 1)))) = needle Then
+                j = j + 1
+                outArr(j, 1) = vDoc(i, 1)
+                outArr(j, 2) = vAmt(i, 1)
+                outArr(j, 3) = vbNullString
+            End If
+        Next i
+    End If
+
+
+    ' Запомним формат исходной суммы (если есть хотя бы одна строка)
+    Dim srcAmtFormat As String
+    If outRows > 0 Then
+        Dim firstIdx As Long
+        firstIdx = 0
+        For i = 1 To nSrc
+            If LCase$(Trim$(CStr(vMap(i, 1)))) = needle Then
+                firstIdx = i
+                Exit For
+            End If
+        Next i
+        If firstIdx > 0 Then
+            srcAmtFormat = wsSrc.Cells(srcDataTop + firstIdx - 1, srcColAmt).NumberFormat
+        End If
+    End If
+
+
+    NTC_LogWrite "Итог фильтрации: выбрано строк=" & outRows
+    NTC_EndStep
+
+
+    '==================== 4) Синхронизация размеров области на приёмнике ====================
+    NTC_StartStep "Синхронизация высоты области вставки"
+    Dim curRows As Long
+    curRows = Application.WorksheetFunction.Max(0, dstDataBottom - dstDataTop + 1)
+
+
+    If outRows > curRows Then
+        Dim toInsert As Long: toInsert = outRows - curRows
+        wsDst.Rows(dstTotalRow).Resize(toInsert).Insert Shift:=xlDown
+        dstTotalRow = dstTotalRow + toInsert
+        dstDataBottom = dstTotalRow - 1
+        NTC_LogWrite "Добавлены строки: " & toInsert
+    ElseIf outRows < curRows Then
+        Dim toDelete As Long: toDelete = curRows - outRows
+        If toDelete > 0 Then
+            wsDst.Rows(dstDataTop + outRows).Resize(toDelete).Delete Shift:=xlUp
+            dstTotalRow = dstTotalRow - toDelete
+            dstDataBottom = dstTotalRow - 1
+            NTC_LogWrite "Удалены лишние строки: " & toDelete
+        End If
+    Else
+        NTC_LogWrite "Высота области совпадает: " & curRows
+    End If
+    NTC_EndStep
+
+
+    '==================== 5) Очистка внутренних границ и заполнение ====================
+    NTC_StartStep "Очистка внутренних границ области"
+    If dstDataBottom >= dstDataTop Then
+        With wsDst.Range(wsDst.Cells(dstDataTop, dstFirstCol), wsDst.Cells(dstDataBottom, dstLastCol))
+            .Borders.LineStyle = xlNone
+        End With
+    End If
+    NTC_EndStep
+
+
+    NTC_StartStep "Заполнение данных"
+    If outRows > 0 Then
+        ' Вставляем значения массивом
+        Dim dstRange As Range
+        Set dstRange = wsDst.Range(wsDst.Cells(dstDataTop, dstColDoc), wsDst.Cells(dstDataTop + outRows - 1, dstColCmt))
+        dstRange.Value = outArr
+
+
+        ' Применим формат чисел колонки "Сумма" как у источника (если был найден)
+        If Len(srcAmtFormat) > 0 Then
+            wsDst.Range(wsDst.Cells(dstDataTop, dstColAmt), wsDst.Cells(dstDataTop + outRows - 1, dstColAmt)).NumberFormat = srcAmtFormat
+        End If
+    Else
+        ' Область пустая — очистим её
+        If dstDataBottom >= dstDataTop Then
+            wsDst.Range(wsDst.Cells(dstDataTop, dstColDoc), wsDst.Cells(dstDataBottom, dstColCmt)).ClearContents
+        End If
+    End If
+    NTC_EndStep
+
+
+    '==================== 6) Рамка вокруг вставленных строк ====================
+    NTC_StartStep "Рисование внешней рамки"
+    If outRows > 0 Then
+        Dim rngBorder As Range
+        Set rngBorder = wsDst.Range(wsDst.Cells(dstDataTop, dstFirstCol), wsDst.Cells(dstDataTop + outRows - 1, dstLastCol))
+        NTC_DrawThickOuterBorder rngBorder
+    End If
+    NTC_EndStep
+
+
+    '==================== 7) Формула ИТОГО под колонкой Сумма ====================
+    NTC_StartStep "Формула Итого под 'Сумма'"
+    Dim sumCell As Range
+    Set sumCell = wsDst.Cells(dstTotalRow, dstColAmt)
+
+
+    If outRows > 0 Then
+        Dim sumRange As Range
+        Set sumRange = wsDst.Range(wsDst.Cells(dstDataTop, dstColAmt), wsDst.Cells(dstDataTop + outRows - 1, dstColAmt))
+        sumCell.FormulaLocal = "=СУММ(" & sumRange.Address(False, False) & ")"
+    Else
+        ' Нет вставленных строк — пусть будет 0
+        sumCell.Value = 0
+    End If
+    NTC_EndStep
+
+
+    NTC_LogWrite "Готово. Вставлено строк=" & outRows & "; Время, сек=" & Format$(Timer - t0, "0.000")
+    GoTo Tidy
+
+
+EH:
+    NTC_LogWrite "ОШИБКА: " & Err.Number & " — " & Err.Description
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+End Sub
+
+
+'========================================================================================
+' ВСПОМОГАТЕЛЬНЫЕ ПРОЦЕДУРЫ
+'========================================================================================
+
+
+Private Function NTC_FindAnchorRow(ByVal ws As Worksheet, ByVal searchCol As Long, ByVal anchorText As String) As Long
+    On Error Resume Next
+    Dim f As Range
+    Set f = ws.Columns(searchCol).Find(What:=anchorText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        NTC_FindAnchorRow = 0
+    Else
+        If f.MergeCells Then
+            NTC_FindAnchorRow = f.MergeArea.Row
+        Else
+            NTC_FindAnchorRow = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function NTC_FindBelowExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    On Error Resume Next
+    Dim f As Range
+    Set f = ws.Range(ws.Cells(minRow, col), ws.Cells(ws.Rows.Count, col)).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        NTC_FindBelowExact = 0
+    Else
+        If f.MergeCells Then
+            NTC_FindBelowExact = f.MergeArea.Row
+        Else
+            NTC_FindBelowExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function NTC_BuildHeaderMap(ByVal ws As Worksheet, ByVal hdrRow As Long) As Object
+    On Error GoTo EH
+    Dim map As Object
+    Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = 0
+
+
+    If ws Is Nothing Then GoTo OutOk
+    If hdrRow < 1 Then GoTo OutOk
+
+
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then GoTo OutOk
+
+
+    Dim c As Long, k As String
+    For c = 1 To lastCol
+        k = NTC_NormHdr(CStr(ws.Cells(hdrRow, c).Value))
+        If Len(k) > 0 Then
+            If Not map.Exists(k) Then
+                map(k) = c
+            End If
+        End If
+    Next c
+
+
+OutOk:
+    Set NTC_BuildHeaderMap = map
+    Exit Function
+
+
+EH:
+    Set NTC_BuildHeaderMap = map
+End Function
+
+
+Private Function NTC_FindHeader(ByVal hdrMap As Object, ByVal syns As Variant) As Long
+    On Error Resume Next
+    Dim i As Long, k As String
+    If hdrMap Is Nothing Then Exit Function
+    For i = LBound(syns) To UBound(syns)
+        k = NTC_NormHdr(CStr(syns(i)))
+        If hdrMap.Exists(k) Then
+            NTC_FindHeader = CLng(hdrMap(k))
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Function NTC_LastDataRow(ByVal ws As Worksheet, ByVal col As Long) As Long
+    On Error Resume Next
+    Dim lr As Long
+    lr = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+    If lr < 2 Then lr = 2
+    NTC_LastDataRow = lr
+End Function
+
+
+Private Function NTC_NormHdr(ByVal s As String) As String
+    s = Replace$(s, ChrW(160), " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NTC_NormHdr = LCase$(s)
+End Function
+
+
+Private Sub NTC_DrawThickOuterBorder(ByVal rng As Range)
+    On Error Resume Next
+    With rng.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+End Sub
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+
+
+Private Sub NTC_LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub NTC_StartStep(ByVal stepName As String)
+    curStep = stepName
+    stepT = Timer
+    NTC_LogWrite Format$(Now, "dd.mm.yyyy HH:nn") & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub NTC_EndStep()
+    NTC_LogWrite Format$(Now, "dd.mm.yyyy HH:nn") & vbTab & "<< " & curStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    curStep = vbNullString
+End Sub

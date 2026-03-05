@@ -1,0 +1,805 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modJP_Mapping_FastEval
+' Версия:    1.9.3  (16.09.2025)
+'
+' Что нового vs 1.9.2:
+'   - "Нулевая сумма" определяется как ПУСТАЯ ячейка "Сумма" (Empty/"" после Trim/NBSP).
+'   - Правило применяется РАНО (во время меппинга) и байпасит остальные правила по строке.
+'   - Убран пост-проход ZeroSumOverride; добавлены логи ZeroSum(Early).
+'
+' Что нового vs 1.9.1:
+'   - (ранее) пост-проход оверрайда "Нулевая сумма".
+'
+' Базовая логика:
+'   0) Ранний байпас: если Сумма пуста -> "Нулевая сумма"
+'   1) FX и Проценты, затем 2) быстрые правила, затем 3) «Популяция для тестирования»
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.9.3"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' ---------------- РЕЖИМЫ И РУБИЛЬНИКИ ----------------
+Private Enum FxScopeMode
+    fxContentOnly = 0
+    fxContentPlus6Sub = 1
+End Enum
+
+
+Private Const ENABLE_FX As Boolean = True
+Private Const ENABLE_INTEREST As Boolean = True
+Private Const FX_SCOPE As Long = fxContentPlus6Sub
+'-----------------------------------------------------
+
+
+'============================== ТОЧКИ ВХОДА ====================================
+
+
+Public Sub Проставить_Меппинг_Во_Всех_Журналах()
+    Dim t0 As Double: t0 = Timer
+    Private_StartPerf
+    On Error GoTo EH
+
+
+    Private_Log "Старт v" & MODULE_VERSION & _
+                "; FX=" & IIf(ENABLE_FX, IIf(FX_SCOPE = fxContentOnly, "ContentOnly", "Content+6Sub"), "OFF") & _
+                "; Interest=" & IIf(ENABLE_INTEREST, "ON", "OFF")
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim ws As Worksheet, n As Long
+    For Each ws In wb.Worksheets
+        If IsProcessedJPSheet(ws) Then
+            ProcessOneSheet ws
+            n = n + 1
+        End If
+    Next ws
+
+
+    Private_Log "Обработано листов: " & n
+    Private_FinishPerf t0, "Готово"
+    Exit Sub
+EH:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+    Private_FinishPerf t0, "С ошибкой"
+End Sub
+
+
+Public Sub Проставить_Меппинг_На_Активном_Листе()
+    Dim t0 As Double: t0 = Timer
+    Private_StartPerf
+    On Error GoTo EH
+
+
+    If IsProcessedJPSheet(ActiveSheet) Then
+        ProcessOneSheet ActiveSheet
+    Else
+        Private_Log "Активный лист не похож на обработанный ЖП (нет нужных заголовков)."
+    End If
+
+
+    Private_FinishPerf t0, "Готово"
+    Exit Sub
+EH:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+    Private_FinishPerf t0, "С ошибкой"
+End Sub
+
+
+'============================== ОСНОВНАЯ ОБРАБОТКА =============================
+
+
+Private Sub ProcessOneSheet(ByVal ws As Worksheet)
+    Dim hdrRow As Long: hdrRow = 1
+
+
+    ' --- заголовки ---
+    Dim cDt As Long:     cDt = FindHeaderCol(ws, "Счет Дт", hdrRow)
+    Dim cKt As Long:     cKt = FindHeaderCol(ws, "Счет Кт", hdrRow)
+    Dim cLinked As Long: cLinked = FindHeaderCol(ws, "Связанные?", hdrRow)
+    Dim cText As Long:   cText = FindHeaderCol_Content(ws, hdrRow)
+
+
+    Dim cS1Dt As Long: cS1Dt = FindHeaderCol(ws, "Субконто1 Дт", hdrRow)
+    Dim cS2Dt As Long: cS2Dt = FindHeaderCol(ws, "Субконто2 Дт", hdrRow)
+    Dim cS3Dt As Long: cS3Dt = FindHeaderCol(ws, "Субконто3 Дт", hdrRow)
+    Dim cS1Kt As Long: cS1Kt = FindHeaderCol(ws, "Субконто1 Кт", hdrRow)
+    Dim cS2Kt As Long: cS2Kt = FindHeaderCol(ws, "Субконто2 Кт", hdrRow)
+    Dim cS3Kt As Long: cS3Kt = FindHeaderCol(ws, "Субконто3 Кт", hdrRow)
+
+
+    ' колонка суммы (ищем по синонимам)
+    Dim cSum As Long
+    cSum = FindHeaderCol_BySyn(ws, hdrRow, Array("сумма", "сумма проводки", "amount"))
+
+
+    If cDt = 0 Or cKt = 0 Or cLinked = 0 Then
+        Private_Log "Пропуск '" & ws.Name & "': нет одной из колонок (Счет Дт/Счет Кт/Связанные?)."
+        Exit Sub
+    End If
+
+
+    Dim lastRow As Long: lastRow = LastDataRow(ws, cDt, cKt)
+    If lastRow < 2 Then
+        Private_Log "Пропуск '" & ws.Name & "': только шапка."
+        Exit Sub
+    End If
+
+
+    Private_Log "Колонки: СчетДт=" & cDt & "; СчетКт=" & cKt & _
+                "; Связанные?=" & cLinked & "; Содержание=" & IIf(cText > 0, CStr(cText), "нет")
+    Private_Log "Субконто колонки: S1Dt=" & ReportZero(cS1Dt) & "; S2Dt=" & ReportZero(cS2Dt) & _
+                "; S3Dt=" & ReportZero(cS3Dt) & "; S1Kt=" & ReportZero(cS1Kt) & _
+                "; S2Kt=" & ReportZero(cS2Kt) & "; S3Kt=" & ReportZero(cS3Kt)
+    Private_Log "Колонка суммы: " & ReportZero(cSum)
+
+
+    ' --- целевая колонка «Меппинг» справа от «Связанные?» ---
+    Dim targetCol As Long: targetCol = cLinked + 1
+    Dim cMap As Long:      cMap = FindHeaderCol(ws, "Меппинг", hdrRow)
+
+
+    Dim evtsWas As Boolean: evtsWas = Application.EnableEvents
+    On Error GoTo SafeExit
+    Application.EnableEvents = False
+
+
+    If cMap = 0 Then
+        ws.Columns(targetCol).Insert
+        ws.Cells(hdrRow, targetCol).Value = "Меппинг"
+        Private_Log "Лист '" & ws.Name & "': создан столбец 'Меппинг' в кол." & targetCol
+    ElseIf cMap <> targetCol Then
+        ws.Columns(cMap).Cut
+        ws.Columns(targetCol).Insert
+        ws.Cells(hdrRow, targetCol).Value = "Меппинг"
+        Private_Log "Лист '" & ws.Name & "': столбец 'Меппинг' перемещён в кол." & targetCol
+    Else
+        ws.Range(ws.Cells(2, targetCol), ws.Cells(lastRow, targetCol)).ClearContents
+        Private_Log "Лист '" & ws.Name & "': столбец 'Меппинг' переиспользован."
+    End If
+    ws.Columns(targetCol).NumberFormat = "@"
+
+
+    ' ---------- Чтение данных в память ----------
+    Dim r1 As Long: r1 = 2
+    Dim r2 As Long: r2 = lastRow
+    Dim n As Long:  n = r2 - r1 + 1
+
+
+    Dim aDt As Variant, aKt As Variant
+    aDt = ws.Range(ws.Cells(r1, cDt), ws.Cells(r2, cDt)).Value2
+    aKt = ws.Range(ws.Cells(r1, cKt), ws.Cells(r2, cKt)).Value2
+
+
+    Dim aText As Variant
+    If cText > 0 Then aText = ws.Range(ws.Cells(r1, cText), ws.Cells(r2, cText)).Value2
+
+
+    Dim aS1Dt As Variant, aS2Dt As Variant, aS3Dt As Variant
+    Dim aS1Kt As Variant, aS2Kt As Variant, aS3Kt As Variant
+    If cS1Dt > 0 Then aS1Dt = ws.Range(ws.Cells(r1, cS1Dt), ws.Cells(r2, cS1Dt)).Value2
+    If cS2Dt > 0 Then aS2Dt = ws.Range(ws.Cells(r1, cS2Dt), ws.Cells(r2, cS2Dt)).Value2
+    If cS3Dt > 0 Then aS3Dt = ws.Range(ws.Cells(r1, cS3Dt), ws.Cells(r2, cS3Dt)).Value2
+    If cS1Kt > 0 Then aS1Kt = ws.Range(ws.Cells(r1, cS1Kt), ws.Cells(r2, cS1Kt)).Value2
+    If cS2Kt > 0 Then aS2Kt = ws.Range(ws.Cells(r1, cS2Kt), ws.Cells(r2, cS2Kt)).Value2
+    If cS3Kt > 0 Then aS3Kt = ws.Range(ws.Cells(r1, cS3Kt), ws.Cells(r2, cS3Kt)).Value2
+
+
+    Dim aSum As Variant
+    If cSum > 0 Then aSum = ws.Range(ws.Cells(r1, cSum), ws.Cells(r2, cSum)).Value2
+
+
+    ' ---------- Ранний байпас: "Нулевая сумма" ----------
+    Dim outArr() As Variant: ReDim outArr(1 To n, 1 To 1)
+    Dim isZero() As Boolean
+    Dim zeroMarkCnt As Long
+
+
+    If cSum > 0 Then
+        ReDim isZero(1 To n)
+        Dim i As Long
+        For i = 1 To n
+            isZero(i) = IsBlankLike(aSum(i, 1))
+            If isZero(i) Then
+                outArr(i, 1) = "Нулевая сумма"
+                zeroMarkCnt = zeroMarkCnt + 1
+            End If
+        Next i
+        Private_Log "ZeroSum(Early) пометок: " & zeroMarkCnt
+    Else
+        Private_Log "Колонка 'Сумма' не найдена — правило 'Нулевая сумма' не активно."
+    End If
+
+
+    ' ---------- Препроход: FX/Проценты ----------
+    Dim fxFromContent As Long, fxFromSubs As Long, intFromContent As Long
+    Dim s As String, hit As Boolean
+    Dim ii As Long
+
+
+    If ENABLE_FX Or ENABLE_INTEREST Then
+        For ii = 1 To n
+            ' пропускаем строки, уже помеченные как Нулевая сумма
+            If outArr(ii, 1) <> vbNullString Then GoTo NextPre
+
+
+            ' --- FX ---
+            If ENABLE_FX Then
+                hit = False
+
+
+                ' 1) Содержание
+                If Not IsEmpty(aText) Then
+                    s = VToStr(aText(ii, 1))
+                    If IsFXCell(s) Then
+                        outArr(ii, 1) = "Курсовые разницы"
+                        fxFromContent = fxFromContent + 1
+                        hit = True
+                    End If
+                End If
+
+
+                ' 2) 6 субконто
+                If Not hit And FX_SCOPE = fxContentPlus6Sub Then
+                    If Not IsEmpty(aS1Dt) Then If IsFXCell(VToStr(aS1Dt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                    If Not hit And Not IsEmpty(aS2Dt) Then If IsFXCell(VToStr(aS2Dt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                    If Not hit And Not IsEmpty(aS3Dt) Then If IsFXCell(VToStr(aS3Dt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                    If Not hit And Not IsEmpty(aS1Kt) Then If IsFXCell(VToStr(aS1Kt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                    If Not hit And Not IsEmpty(aS2Kt) Then If IsFXCell(VToStr(aS2Kt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                    If Not hit And Not IsEmpty(aS3Kt) Then If IsFXCell(VToStr(aS3Kt(ii, 1))) Then outArr(ii, 1) = "Курсовые разницы": fxFromSubs = fxFromSubs + 1: hit = True
+                End If
+            End If
+
+
+            ' --- Interest ---
+            If ENABLE_INTEREST Then
+                If outArr(ii, 1) = vbNullString Then
+                    If Not IsEmpty(aText) Then
+                        s = VToStr(aText(ii, 1))
+                        If IsInterestCell(s) Then
+                            outArr(ii, 1) = "Начисление процентов"
+                            intFromContent = intFromContent + 1
+                        End If
+                    End If
+                End If
+            End If
+NextPre:
+        Next ii
+    End If
+
+
+    If FX_SCOPE = fxContentPlus6Sub Then
+        Private_Log "Препроход(без Evaluate): FX(Content)=" & fxFromContent & "; FX(Sub)=" & fxFromSubs & _
+                    "; Interest(Content)=" & intFromContent
+    Else
+        Private_Log "Препроход(без Evaluate): FX(Content)=" & fxFromContent & "; Interest(Content)=" & intFromContent
+    End If
+
+
+    ' ---------- Быстрые правила ----------
+    Dim fastHits As Long, lbl As String
+    Dim debRaw As String, kreRaw As String
+    Dim bDt As String, bKt As String
+    Dim contentRaw As String
+    Dim sDt As String, sKt As String
+
+
+    Dim k As Long
+    For k = 1 To n
+        ' пропускаем строки, уже помеченные как Нулевая сумма или FX/Interest
+        If outArr(k, 1) <> vbNullString Then GoTo NextFast
+
+
+        debRaw = VToStr(aDt(k, 1))
+        kreRaw = VToStr(aKt(k, 1))
+        bDt = RootBeforeDot(debRaw)
+        bKt = RootBeforeDot(kreRaw)
+        sDt = vbNullString
+        sKt = vbNullString
+
+
+        If cText > 0 Then
+            contentRaw = VToStr(aText(k, 1))
+        Else
+            contentRaw = vbNullString
+        End If
+
+
+        lbl = EvaluateFastRules_LazySub(bDt, bKt, debRaw, kreRaw, contentRaw, sDt, sKt)
+        If lbl <> vbNullString Then
+            outArr(k, 1) = lbl
+            fastHits = fastHits + 1
+        End If
+NextFast:
+    Next k
+
+
+    ' ---------- Остаток > «Популяция для тестирования» ----------
+    Dim noRule As Long
+    Dim r As Long
+    For r = 1 To n
+        If outArr(r, 1) = vbNullString Then
+            outArr(r, 1) = "Популяция для тестирования"
+            noRule = noRule + 1
+        End If
+    Next r
+
+
+    ' ---------- Запись результата ----------
+    ws.Range(ws.Cells(r1, targetCol), ws.Cells(r2, targetCol)).Value = outArr
+
+
+    Private_Log "Итог лист '" & ws.Name & "': FX=" & (fxFromContent + fxFromSubs) & _
+                "; Interest=" & intFromContent & _
+                "; быстрые=" & fastHits & _
+                "; Н.п.=" & noRule & _
+                "; ZeroSum(Early)=" & zeroMarkCnt
+
+
+SafeExit:
+    Application.EnableEvents = evtsWas
+End Sub
+
+
+'============================== ТЕКСТОВЫЕ ДЕТЕКТОРЫ ============================
+
+
+Private Function IsFXCell(ByVal s As String) As Boolean
+    If LenB(s) = 0 Then Exit Function
+    Dim b1 As Boolean, b2 As Boolean, b3 As Boolean, b4 As Boolean
+    b1 = (InStr(1, s, "курс", vbTextCompare) > 0 And InStr(1, s, "разн", vbTextCompare) > 0)
+    b2 = (InStr(1, s, "откл", vbTextCompare) > 0 And InStr(1, s, "курс", vbTextCompare) > 0)
+    b3 = (InStr(1, s, "переоцен", vbTextCompare) > 0 And InStr(1, s, "валют", vbTextCompare) > 0)
+    b4 = (InStr(1, s, "продажа валюты", vbTextCompare) > 0)
+    IsFXCell = (b1 Or b2 Or b3 Or b4)
+End Function
+
+
+Private Function IsInterestCell(ByVal s As String) As Boolean
+    If LenB(s) = 0 Then Exit Function
+    Dim p As Boolean, ctx As Boolean
+    p = (InStr(1, s, "начислен", vbTextCompare) > 0 And InStr(1, s, "процент", vbTextCompare) > 0) _
+        Or (InStr(1, s, "проценты", vbTextCompare) > 0)
+    ctx = (InStr(1, s, "фин", vbTextCompare) > 0 Or InStr(1, s, "займ", vbTextCompare) > 0 Or InStr(1, s, "кредит", vbTextCompare) > 0) _
+        Or (InStr(1, s, "%", vbTextCompare) > 0 And InStr(1, s, "кредит", vbTextCompare) > 0)
+    IsInterestCell = (p And ctx)
+End Function
+
+
+'============================== ХЕЛПЕРЫ ПО СЧЕТАМ/ТЕКСТУ =======================
+
+
+Private Function VToStr(ByVal v As Variant) As String
+    On Error Resume Next
+    VToStr = CStr(v)
+    On Error GoTo 0
+End Function
+
+
+Private Function RootBeforeDot(ByVal s As String) As String
+    Dim p As Long
+    s = Trim$(CStr(s))
+    If LenB(s) = 0 Then Exit Function
+    p = InStr(1, s, ".", vbBinaryCompare)
+    If p > 1 Then
+        RootBeforeDot = Left$(s, p - 1)
+    Else
+        RootBeforeDot = s
+    End If
+End Function
+
+
+Private Function FirstSubQuick(ByVal s As String) As String
+    Dim p1 As Long, l As Long, part As String
+    s = Trim$(CStr(s))
+    p1 = InStr(1, s, ".", vbBinaryCompare)
+    If p1 = 0 Then Exit Function
+    part = Mid$(s, p1 + 1)
+    l = InStrAny(part, ". " & vbTab)
+    If l = 0 Then
+        FirstSubQuick = part
+    Else
+        FirstSubQuick = Left$(part, l - 1)
+    End If
+End Function
+
+
+Private Function InStrAny(ByVal s As String, ByVal delims As String) As Long
+    Dim i As Long, p As Long, best As Long
+    best = 0
+    For i = 1 To Len(delims)
+        p = InStr(1, s, Mid$(delims, i, 1), vbBinaryCompare)
+        If p > 0 Then
+            If best = 0 Or p < best Then best = p
+        End If
+    Next i
+    InStrAny = best
+End Function
+
+
+Private Function StartsWithABorVA(ByVal s As String) As Boolean
+    If LenB(s) = 0 Then Exit Function
+    Dim pref2 As String: pref2 = Left$(s, 2)
+    StartsWithABorVA = (pref2 = "АВ" Or pref2 = "AB" Or pref2 = "ВА" Or pref2 = "VA")
+End Function
+
+
+Private Function StartsWithLetterFast(ByVal s As String) As Boolean
+    If LenB(s) = 0 Then Exit Function
+    Dim ch As Integer: ch = AscW(Left$(s, 1))
+    StartsWithLetterFast = (ch >= 65 And ch <= 90) Or (ch >= 97 And ch <= 122) _
+                        Or (ch >= 1040 And ch <= 1103) Or (ch = 1025) Or (ch = 1105)
+End Function
+
+
+Private Function StartsWithNDigits(ByVal s As String, ByVal n As Long) As Boolean
+    Dim i As Long, ch As Integer
+    s = Trim$(CStr(s))
+    If Len(s) < n Then Exit Function
+    For i = 1 To n
+        ch = AscW(Mid$(s, i, 1))
+        If ch < 48 Or ch > 57 Then Exit Function
+    Next i
+    StartsWithNDigits = True
+End Function
+
+
+'============================== БЫСТРЫЕ ПРАВИЛА ================================
+
+
+Private Function EvaluateFastRules_LazySub( _
+    ByVal bDt As String, ByVal bKt As String, _
+    ByVal debRaw As String, ByVal kreRaw As String, _
+    ByVal contentRaw As String, _
+    ByRef sDt As String, ByRef sKt As String) As String
+
+
+    ' 1 Налоги (исключение Дт 68 / Кт 51)
+    If bDt = "68" Or bKt = "68" Or bDt = "19" Or bKt = "19" Or bDt = "90" Or bKt = "90" Or bDt = "76" Or bKt = "76" Then
+        If (bDt = "68" And bKt = "51") Then
+            ' skip
+        Else
+            If bDt = "90" Or bKt = "90" Then
+                If bDt = "90" Then If LenB(sDt) = 0 Then sDt = FirstSubQuick(debRaw)
+                If bKt = "90" Then If LenB(sKt) = 0 Then sKt = FirstSubQuick(kreRaw)
+                If Left$(sDt, 2) = "03" Or Left$(sKt, 2) = "03" Then EvaluateFastRules_LazySub = "Налоги": Exit Function
+            End If
+            If bDt = "76" Or bKt = "76" Then
+                If bDt = "76" Then If LenB(sDt) = 0 Then sDt = FirstSubQuick(debRaw)
+                If bKt = "76" Then If LenB(sKt) = 0 Then sKt = FirstSubQuick(kreRaw)
+                If StartsWithABorVA(sDt) Or StartsWithABorVA(sKt) Then EvaluateFastRules_LazySub = "Налоги": Exit Function
+            End If
+            If bDt = "68" Or bKt = "68" Or bDt = "19" Or bKt = "19" Then
+                EvaluateFastRules_LazySub = "Налоги": Exit Function
+            End If
+        End If
+    End If
+
+
+    ' 2 Налоговые активы
+    If bDt = "09" Or bKt = "09" Then EvaluateFastRules_LazySub = "Налоговые активы": Exit Function
+
+
+    ' 3 Налоговые обязательства
+    If bDt = "77" Or bKt = "77" Then EvaluateFastRules_LazySub = "Налоговые обязательства": Exit Function
+
+
+    ' 5 Внутренний оборот (исключение 76.07.x)
+    If LenB(bDt) > 0 And bDt = bKt Then
+        If bDt = "76" Then
+            If LenB(sDt) = 0 Then sDt = FirstSubQuick(debRaw)
+            If LenB(sKt) = 0 Then sKt = FirstSubQuick(kreRaw)
+            If Left$(sDt, 2) = "07" Or Left$(sKt, 2) = "07" Then
+                ' skip
+            Else
+                EvaluateFastRules_LazySub = "Внутренний оборот": Exit Function
+            End If
+        Else
+            EvaluateFastRules_LazySub = "Внутренний оборот": Exit Function
+        End If
+    End If
+
+
+    ' 6 ОС
+    Dim inOS_D As Boolean, inOS_K As Boolean
+    Select Case bDt
+        Case "01", "02", "07", "08", "04": inOS_D = True
+    End Select
+    Select Case bKt
+        Case "01", "02", "07", "08", "04": inOS_K = True
+    End Select
+    If inOS_D And inOS_K Then EvaluateFastRules_LazySub = "Внутренние движения по ОС": Exit Function
+
+
+    ' 7 НМА
+    Dim inNMA_D As Boolean, inNMA_K As Boolean
+    Select Case bDt
+        Case "04", "05", "08": inNMA_D = True
+    End Select
+    Select Case bKt
+        Case "04", "05", "08": inNMA_K = True
+    End Select
+    If inNMA_D And inNMA_K Then EvaluateFastRules_LazySub = "Внутренние движения по НМА": Exit Function
+
+
+    ' 8 Проценты (91 > 67/66)
+    If bDt = "91" And (bKt = "67" Or bKt = "66") Then EvaluateFastRules_LazySub = "Начисление процентов": Exit Function
+
+
+    ' 9 Амортизация
+    If bDt = "02" Or bKt = "02" Or bDt = "05" Or bKt = "05" Then EvaluateFastRules_LazySub = "Амортизация": Exit Function
+
+
+    ' 10 Денежные средства
+    Dim inCash_D As Boolean, inCash_K As Boolean
+    Select Case bDt
+        Case "50", "51", "52", "55", "57": inCash_D = True
+    End Select
+    Select Case bKt
+        Case "50", "51", "52", "55", "57": inCash_K = True
+    End Select
+    If inCash_D And inCash_K Then EvaluateFastRules_LazySub = "Денежные средства": Exit Function
+
+
+    ' 12 Реформация/финрезультат
+    Dim inSet_D As Boolean, inSet_K As Boolean
+    Select Case bDt
+        Case "91", "84", "99", "90": inSet_D = True
+    End Select
+    Select Case bKt
+        Case "91", "84", "99", "90": inSet_K = True
+    End Select
+    If (bDt = "99" And inSet_K) Or (bKt = "99" And inSet_D) Or _
+       ((bDt = "90" And bKt = "99") Or (bKt = "90" And bDt = "99")) Then
+        EvaluateFastRules_LazySub = "Реформация/финрезультат": Exit Function
+    End If
+
+
+    ' 13 Резервы
+    If (bDt = "14" Or bDt = "59" Or bDt = "63" Or bDt = "96") Or _
+       (bKt = "14" Or bKt = "59" Or bKt = "63" Or bKt = "96") Then
+        EvaluateFastRules_LazySub = "Резервы": Exit Function
+    End If
+
+
+    ' 14 Списание материалов
+    If bKt = "10" Then EvaluateFastRules_LazySub = "Списание материалов": Exit Function
+
+
+    ' 15 Затраты/ГП — внутри (добавлен 28)
+    Dim inZGP_D As Boolean, inZGP_K As Boolean
+    Select Case bDt
+        Case "10", "15", "16", "20", "21", "23", "25", "26", "28", "40", "41", "43", "44": inZGP_D = True
+    End Select
+    Select Case bKt
+        Case "10", "15", "16", "20", "21", "23", "25", "26", "28", "40", "41", "43", "44": inZGP_K = True
+    End Select
+    If inZGP_D And inZGP_K Then EvaluateFastRules_LazySub = "Затраты/ГП — внутри": Exit Function
+
+
+    ' 16 Забалансовые операции
+    If StartsWithNDigits(debRaw, 3) Or StartsWithNDigits(kreRaw, 3) _
+       Or StartsWithLetterFast(debRaw) Or StartsWithLetterFast(kreRaw) Then
+        EvaluateFastRules_LazySub = "Забалансовые операции": Exit Function
+    End If
+
+
+    ' 17 Внутри запасов (добавлен 94)
+    Dim inStock_D As Boolean, inStock_K As Boolean
+    Select Case bDt
+        Case "10", "15", "16", "21", "40", "41", "43", "45", "94": inStock_D = True
+    End Select
+    Select Case bKt
+        Case "10", "15", "16", "21", "40", "41", "43", "45", "94": inStock_K = True
+    End Select
+    If inStock_D And inStock_K Then EvaluateFastRules_LazySub = "Внутри запасов": Exit Function
+
+
+    ' 18 Расчёты / Взаимозачёт (исключить 76.07.*)
+    Dim inCalc_D As Boolean, inCalc_K As Boolean
+    Select Case bDt
+        Case "60", "62", "76": inCalc_D = True
+    End Select
+    Select Case bKt
+        Case "60", "62", "76": inCalc_K = True
+    End Select
+    If inCalc_D And inCalc_K Then
+        If bDt = "76" Then If LenB(sDt) = 0 Then sDt = FirstSubQuick(debRaw)
+        If bKt = "76" Then If LenB(sKt) = 0 Then sKt = FirstSubQuick(kreRaw)
+        If Not (bDt = "76" And Left$(sDt, 2) = "07") And Not (bKt = "76" And Left$(sKt, 2) = "07") Then
+            If contentRaw <> vbNullString Then
+                If InStr(1, contentRaw, "взаимозачет", vbTextCompare) > 0 Or _
+                   InStr(1, contentRaw, "взаимозачёт", vbTextCompare) > 0 Then
+                    EvaluateFastRules_LazySub = "Взаимозачёт": Exit Function
+                End If
+            End If
+            EvaluateFastRules_LazySub = "Расчёты / Взаимозачёт": Exit Function
+        End If
+    End If
+
+
+    ' 19 Списание РБП
+    Dim inRBP_D As Boolean, inRBP_K As Boolean
+    Select Case bDt
+        Case "08", "10", "20", "23", "25", "26", "29", "41", "43", "44", "91", "96": inRBP_D = True
+    End Select
+    Select Case bKt
+        Case "08", "10", "20", "23", "25", "26", "29", "41", "43", "44", "91", "96": inRBP_K = True
+    End Select
+    If (bDt = "97" And inRBP_K) Or (bKt = "97" And inRBP_D) Then
+        EvaluateFastRules_LazySub = "Списание РБП": Exit Function
+    End If
+
+
+    ' 20 Списание расходов (добавлен 25)
+    Dim inExp_D As Boolean, inExp_K As Boolean
+    Select Case bDt
+        Case "20", "21", "23", "25", "26", "29", "40", "41", "42", "43", "44", "45": inExp_D = True
+    End Select
+    Select Case bKt
+        Case "20", "21", "23", "25", "26", "29", "40", "41", "42", "43", "44", "45": inExp_K = True
+    End Select
+    If (bDt = "90" And inExp_K) Or (bKt = "90" And inExp_D) Then
+        EvaluateFastRules_LazySub = "Списание расходов": Exit Function
+    End If
+End Function
+
+
+'============================== ПОИСК ШАПКИ/СТРОКИ =============================
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = s
+End Function
+
+
+Private Function FindHeaderCol_Content(ByVal ws As Worksheet, ByVal hdrRow As Long) As Long
+    Dim syns As Variant
+    syns = Array("содержание", "описание", "примечание", "комментар", "комментарий", "memo")
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, head As String, i As Long
+    For c = 1 To lastCol
+        head = NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        For i = LBound(syns) To UBound(syns)
+            If InStr(head, syns(i)) > 0 Then
+                FindHeaderCol_Content = c
+                Exit Function
+            End If
+        Next i
+    Next c
+End Function
+
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal hdrRow As Long) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If CStr(ws.Cells(hdrRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Function FindHeaderCol_BySyn(ByVal ws As Worksheet, ByVal hdrRow As Long, ByVal syns As Variant) As Long
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, head As String, i As Long
+    For c = 1 To lastCol
+        head = NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        If Len(head) > 0 Then
+            For i = LBound(syns) To UBound(syns)
+                If head = NormalizeHeaderText(CStr(syns(i))) Then
+                    FindHeaderCol_BySyn = c
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next c
+End Function
+
+
+Private Function LastDataRow(ByVal ws As Worksheet, ByVal colA As Long, ByVal colB As Long) As Long
+    Dim lrA As Long, lrB As Long
+    lrA = ws.Cells(ws.Rows.Count, colA).End(xlUp).Row
+    lrB = ws.Cells(ws.Rows.Count, colB).End(xlUp).Row
+    If lrA > lrB Then
+        LastDataRow = lrA
+    Else
+        LastDataRow = lrB
+    End If
+    If LastDataRow < 2 Then LastDataRow = 2
+End Function
+
+
+Private Function ReportZero(ByVal v As Long) As String
+    If v > 0 Then ReportZero = CStr(v) Else ReportZero = "нет"
+End Function
+
+
+'============================== ЛОГИ/ПЕРФ ======================================
+
+
+Private Sub Private_Log(ByVal msg As String)
+    Dim ws As Worksheet, r As Long
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "JP Mapping v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Sub Private_StartPerf()
+    On Error Resume Next
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    On Error GoTo 0
+End Sub
+
+
+Private Sub Private_FinishPerf(ByVal t0 As Double, ByVal finalMsg As String)
+    On Error Resume Next
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    On Error GoTo 0
+    Private_Log finalMsg & " — " & Format$(Timer - t0, "0.00") & " c"
+End Sub
+
+
+Private Function IsProcessedJPSheet(ByVal ws As Worksheet) As Boolean
+    IsProcessedJPSheet = (FindHeaderCol(ws, "Счет Дт", 1) > 0 And _
+                          FindHeaderCol(ws, "Счет Кт", 1) > 0 And _
+                          FindHeaderCol(ws, "Связанные?", 1) > 0)
+End Function
+
+
+'============================== ЧИСЛОВЫЕ/ПУСТОТА ХЕЛПЕРЫ =======================
+
+
+Private Function IsBlankLike(ByVal v As Variant) As Boolean
+    ' TRUE для реально пустых и "визуально пустых" значений (включая "" и NBSP)
+    If IsEmpty(v) Then
+        IsBlankLike = True
+        Exit Function
+    End If
+    On Error GoTo Fallback
+    If VarType(v) = vbString Then
+        Dim s As String, nb As String
+        s = CStr(v)
+        nb = Chr$(160)
+        s = Replace$(s, nb, " ")
+        s = Trim$(s)
+        IsBlankLike = (LenB(s) = 0)
+        Exit Function
+    End If
+    ' Числовые/иные типы считаем НЕ пустыми
+    IsBlankLike = False
+    Exit Function
+Fallback:
+    IsBlankLike = False
+End Function

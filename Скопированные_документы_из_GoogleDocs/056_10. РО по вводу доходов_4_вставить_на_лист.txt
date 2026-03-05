@@ -1,0 +1,427 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:  Итоговая_вставка_на_3_Выборка
+' Версия:  1.3.0  (18.09.2025)
+'
+' Источник:      "Итог выборка праздники"   (A1 — шапка, далее данные)
+' Приёмник:      "7. Праздники"
+'
+' Правила вставки:
+'   - В колонке B ищем ячейку, куда входит "К запросу>>>". Под ней (anchorRow+1) — шапка области.
+'   - Низ области — первая "Итого" в той же колонке B. Данные вставляем между шапкой и "Итого".
+'   - Если строк не хватает — вставить; если лишние — удалить.
+'   - Перед вставкой снять все границы внутри области; после — обвести область одной толстой внешней рамкой
+'     с запасом +3 столбца справа.
+'   - В строке "Итого":
+'       • ПОД КОЛОНКОЙ "Сумма" — формула суммирования всех вставленных ячеек этой колонки.
+'       • ПОД КОЛОНКОЙ "Сумма по документу" — формула суммирования аналогично.
+'       • ПОД КОЛОНКОЙ "Расхождение" — формула суммирования аналогично.
+'
+' Сопоставление колонок:
+'   - Колонки сопоставляются по названию заголовка: шапка приёмника определяет порядок/ширину.
+'   - "Счет Дт"/"Счет Кт" — принудительно текст, значения перезаписываются .Text из источника.
+'
+' Форматы:
+'   - Числа в столбцах "Сумма", "Сумма по документу", "Расхождение": NumberFormat = "#,##0;-#,##0;-".
+'
+' Логи:
+'   - Подробно в лист "Логи". Все служебные процедуры — Private.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.3.0"
+
+
+' Листы
+Private Const SRC_SHEET As String = "РО по вводу доходов итог выборк"
+Private Const DST_SHEET As String = "10. РО по вводу доходов"
+
+
+' Поиск в колонке B
+Private Const ANCHOR_TEXT As String = "К запросу>>>"
+Private Const ANCHOR_COL As Long = 2          ' B
+
+
+' Имена заголовков для доп. действий
+Private Const H_SUM       As String = "Сумма"
+Private Const H_SUM_DOC   As String = "Сумма по документу"
+Private Const H_DIFF      As String = "Расхождение"
+Private Const H_DIFF_ALT  As String = "Отклонение" ' на случай альтернативного названия
+Private Const H_DT        As String = "Счет Дт"
+Private Const H_KT        As String = "Счет Кт"
+
+
+' Формат чисел
+Private Const NUM_FMT As String = "#,##0;-#,##0;-"
+
+
+'============================== ТОЧКА ВХОДА ====================================
+Public Sub Вставить_на_лист_РО_по_вводу()
+    Dim t0 As Double: t0 = Timer
+    Private_EnvOff
+    On Error GoTo ErrHandler
+    Private_Log "Старт версии " & MODULE_VERSION
+    
+    ' ---- Листы ----
+    Dim wsS As Worksheet, wsD As Worksheet
+    Set wsS = Private_GetSheet(SRC_SHEET)
+    Set wsD = Private_GetSheet(DST_SHEET)
+    If wsS Is Nothing Then Err.Raise vbObjectError + 1, , "Источник '" & SRC_SHEET & "' не найден."
+    If wsD Is Nothing Then Err.Raise vbObjectError + 2, , "Приёмник '" & DST_SHEET & "' не найден."
+    
+    ' ---- Источник: читаем один раз ----
+    Dim lastRowS As Long, lastColS As Long
+    lastRowS = wsS.Cells(wsS.rows.count, 1).End(xlUp).Row
+    lastColS = wsS.Cells(1, wsS.Columns.count).End(xlToLeft).Column
+    If lastRowS < 1 Or lastColS < 1 Then Err.Raise vbObjectError + 10, , "На '" & SRC_SHEET & "' нет данных."
+    
+    Dim src As Variant
+    src = wsS.Range(wsS.Cells(1, 1), wsS.Cells(lastRowS, lastColS)).Value2
+    Private_Log "Источник: строк=" & lastRowS & "; колонок=" & lastColS
+    
+    ' Шапка источника -> map(header -> col)
+    Dim mapSrc As Object: Set mapSrc = CreateObject("Scripting.Dictionary")
+    mapSrc.CompareMode = vbTextCompare
+    Dim j As Long
+    For j = 1 To lastColS
+        If LenB(src(1, j)) > 0 Then mapSrc(Trim$(CStr(src(1, j)))) = j
+    Next j
+    
+    ' Количество строк данных источника (без шапки)
+    Dim srcRows As Long: srcRows = Application.Max(0, lastRowS - 1)
+    Private_Log "Строк к вставке (без шапки): " & srcRows
+    
+    ' ---- Приёмник: находим якорь и границы области ----
+    Dim anchorCell As Range
+    Set anchorCell = Private_FindInColumn(wsD, ANCHOR_COL, ANCHOR_TEXT, xlPart)
+    If anchorCell Is Nothing Then
+        Err.Raise vbObjectError + 20, , "Не найден '" & ANCHOR_TEXT & "' в колонке B листа '" & DST_SHEET & "'."
+    End If
+    Dim anchorRow As Long: anchorRow = anchorCell.Row
+    Dim headerRow As Long: headerRow = anchorRow + 1
+    Private_Log "Якорь: " & ANCHOR_TEXT & " в " & anchorCell.Address(0, 0) & "; шапка на строке " & headerRow
+    
+    
+    ' Низ ("Итого") в той же колонке B — ПЕРВЫЙ ПОИСК (до подгонки)
+    Dim itogoCell As Range
+    Set itogoCell = Private_FindBelow(wsD, ANCHOR_COL, headerRow, "Итого", xlWhole)
+    If itogoCell Is Nothing Then
+        Err.Raise vbObjectError + 21, , "Не найдена 'Итого' ниже шапки в колонке B."
+    End If
+    Dim itogoRow As Long: itogoRow = itogoCell.Row
+    Private_Log "Итого (до подгонки): " & itogoCell.Address(0, 0)
+    
+    ' Границы колонок области: по шапке (первая и последняя непустая ячейка в строке headerRow)
+    Dim leftCol As Long, rightCol As Long
+    Private_GetHeaderBounds wsD, headerRow, leftCol, rightCol
+    If leftCol = 0 Or rightCol = 0 Or rightCol < leftCol Then
+        Err.Raise vbObjectError + 22, , "Не удалось определить границы шапки на строке " & headerRow & "."
+    End If
+    Private_Log "Границы шапки: L=" & leftCol & "; R=" & rightCol & " (" & (rightCol - leftCol + 1) & " колонок)"
+    
+    ' Карта шапки приёмника (header -> column)
+    Dim mapDst As Object: Set mapDst = CreateObject("Scripting.Dictionary")
+    mapDst.CompareMode = vbTextCompare
+    For j = leftCol To rightCol
+        If LenB(wsD.Cells(headerRow, j).Value) > 0 Then
+            mapDst(Trim$(CStr(wsD.Cells(headerRow, j).Value))) = j
+        End If
+    Next j
+    
+    ' Целевое количество строк в области
+    Dim startRow As Long: startRow = headerRow + 1
+    Dim endRow As Long:   endRow = itogoRow - 1
+    Dim currentRows As Long: currentRows = Application.Max(0, endRow - startRow + 1)
+    Private_Log "Текущий размер области: " & currentRows & " строк; требуется: " & srcRows
+    
+    ' Подгонка количества строк (вставка/удаление)
+    If srcRows > currentRows Then
+        wsD.Range(wsD.Cells(endRow + 1, leftCol), wsD.Cells(endRow + (srcRows - currentRows), rightCol)).Insert Shift:=xlDown
+    ElseIf srcRows < currentRows Then
+        If currentRows > 0 Then
+            wsD.Range(wsD.Cells(startRow + srcRows, leftCol), wsD.Cells(endRow, rightCol)).Delete Shift:=xlUp
+        End If
+    End If
+    
+    ' ПОСЛЕ подгонки — ПОВТОРНО находим "Итого" (строка могла сместиться)
+    Set itogoCell = Private_FindBelow(wsD, ANCHOR_COL, headerRow, "Итого", xlWhole)
+    If itogoCell Is Nothing Then Err.Raise vbObjectError + 23, , "После подгонки не найдена 'Итого' в колонке B."
+    itogoRow = itogoCell.Row
+    
+    ' Обновлённый endRow
+    endRow = startRow + srcRows - 1
+    Private_Log "Подгонка завершена. Новая область: " & startRow & "…" & endRow & "; Итого на " & itogoCell.Address(0, 0)
+    
+    ' Перед вставкой — снять ВСЕ границы в области
+    If srcRows > 0 Then
+        Private_ClearAllBorders wsD.Range(wsD.Cells(startRow, leftCol), wsD.Cells(endRow, rightCol))
+    End If
+    
+    ' Собираем массив вывода согласно шапке приёмника
+    If srcRows > 0 Then
+        Dim outArr As Variant
+        ReDim outArr(1 To srcRows, 1 To (rightCol - leftCol + 1))
+        
+        Dim r As Long, sCol As Long
+        For r = 1 To srcRows
+            For j = leftCol To rightCol
+                Dim hdr As String
+                hdr = Trim$(CStr(wsD.Cells(headerRow, j).Value))
+                If mapSrc.Exists(hdr) Then
+                    sCol = mapSrc(hdr)
+                    outArr(r, j - leftCol + 1) = src(r + 1, sCol)   ' +1 потому что 1-я строка src — шапка
+                Else
+                    outArr(r, j - leftCol + 1) = Empty
+                End If
+            Next j
+        Next r
+        
+        ' Выгрузка одним присваиванием
+        wsD.Range(wsD.Cells(startRow, leftCol), wsD.Cells(endRow, rightCol)).Value = outArr
+        
+        ' Счета как текст (если есть такие колонки в шапке приёмника)
+        Dim dstDtCol As Long, dstKtCol As Long
+        dstDtCol = IIf(mapDst.Exists(H_DT), CLng(mapDst(H_DT)), 0)
+        dstKtCol = IIf(mapDst.Exists(H_KT), CLng(mapDst(H_KT)), 0)
+        If dstDtCol > 0 Then wsD.Columns(dstDtCol).NumberFormat = "@"
+        If dstKtCol > 0 Then wsD.Columns(dstKtCol).NumberFormat = "@"
+        
+        ' Перезапишем «как текст» из источника для Дт/Кт, чтобы сохранить точки/нули
+        Dim cDt As Long, cKt As Long
+        cDt = IIf(mapSrc.Exists(H_DT), CLng(mapSrc(H_DT)), 0)
+        cKt = IIf(mapSrc.Exists(H_KT), CLng(mapSrc(H_KT)), 0)
+        
+        If cDt > 0 And dstDtCol > 0 Then
+            For r = 1 To srcRows
+                wsD.Cells(startRow + r - 1, dstDtCol).Value = wsS.Cells(r + 1, cDt).Text
+            Next r
+        End If
+        If cKt > 0 And dstKtCol > 0 Then
+            For r = 1 To srcRows
+                wsD.Cells(startRow + r - 1, dstKtCol).Value = wsS.Cells(r + 1, cKt).Text
+            Next r
+        End If
+    End If
+    
+    ' --- Форматы чисел для Сумма/Сумма по документу/Расхождение (если есть такие колонки) ---
+    Dim dstSumCol As Long:      dstSumCol = IIf(mapDst.Exists(H_SUM), CLng(mapDst(H_SUM)), 0)
+    Dim dstSumDocCol As Long:   dstSumDocCol = IIf(mapDst.Exists(H_SUM_DOC), CLng(mapDst(H_SUM_DOC)), 0)
+    Dim dstDiffCol As Long
+    If mapDst.Exists(H_DIFF) Then
+        dstDiffCol = CLng(mapDst(H_DIFF))
+    ElseIf mapDst.Exists(H_DIFF_ALT) Then
+        dstDiffCol = CLng(mapDst(H_DIFF_ALT))
+    Else
+        dstDiffCol = 0
+    End If
+    
+    If dstSumCol > 0 Then wsD.Columns(dstSumCol).NumberFormat = NUM_FMT
+    If dstSumDocCol > 0 Then wsD.Columns(dstSumDocCol).NumberFormat = NUM_FMT
+    If dstDiffCol > 0 Then wsD.Columns(dstDiffCol).NumberFormat = NUM_FMT
+    
+    ' --- Заполнение "Расхождение" формулой и суммы под SumDoc/Diff ---
+    If srcRows > 0 Then
+        If dstDiffCol > 0 And dstSumDocCol > 0 And dstSumCol > 0 Then
+            Dim rngDiff As Range
+            Set rngDiff = wsD.Range(wsD.Cells(startRow, dstDiffCol), wsD.Cells(endRow, dstDiffCol))
+            rngDiff.FormulaR1C1 = "=RC[" & (dstSumDocCol - dstDiffCol) & "]-RC[" & (dstSumCol - dstDiffCol) & "]"
+            rngDiff.NumberFormat = NUM_FMT
+            Private_Log "Расхождение формула R1C1 по диапазону " & rngDiff.Address(0, 0)
+        Else
+            If dstDiffCol = 0 Then Private_Log "Внимание: в шапке приёмника нет столбца '" & H_DIFF & "'/'" & H_DIFF_ALT & "' — столбец не заполнен."
+            If dstSumDocCol = 0 Then Private_Log "Внимание: в шапке приёмника нет '" & H_SUM_DOC & "' — сумма по документу не суммируется."
+            If dstSumCol = 0 Then Private_Log "Внимание: в шапке приёмника нет '" & H_SUM & "'."
+        End If
+    End If
+    
+    ' После вставки — толстая внешняя рамка вокруг всей области с запасом +3 столбца
+    If srcRows > 0 Then
+        ' Вычислим правую границу: максимум из R шапки и колоночных индексов суммы/док/расхождения
+        Dim rightExt As Long: rightExt = rightCol
+        If dstSumCol > 0 Then If dstSumCol > rightExt Then rightExt = dstSumCol
+        If dstSumDocCol > 0 Then If dstSumDocCol > rightExt Then rightExt = dstSumDocCol
+        If dstDiffCol > 0 Then If dstDiffCol > rightExt Then rightExt = dstDiffCol
+        rightExt = rightExt
+        
+        Private_DrawOuterThickBorder wsD.Range(wsD.Cells(startRow, leftCol), wsD.Cells(itogoRow - 1, rightExt))
+    End If
+    
+    ' --- Формулы "Итого" ---
+    ' Итого под "Сумма" — было и осталось:
+    If dstSumCol > 0 Then
+        If srcRows > 0 Then
+            Dim sumAddr As String
+            sumAddr = wsD.Range(wsD.Cells(startRow, dstSumCol), wsD.Cells(endRow, dstSumCol)).Address(False, False)
+            wsD.Cells(itogoRow, dstSumCol).FormulaLocal = "=СУММ(" & sumAddr & ")"
+            Private_Log "Итого по 'Сумма' -> " & wsD.Cells(itogoRow, dstSumCol).Address(0, 0) & " по " & sumAddr
+        Else
+            wsD.Cells(itogoRow, dstSumCol).Value = 0
+            Private_Log "Строк нет — 'Итого' по 'Сумма' = 0 в " & wsD.Cells(itogoRow, dstSumCol).Address(0, 0)
+        End If
+    End If
+    
+    ' Итого под "Сумма по документу"
+    If dstSumDocCol > 0 Then
+        If srcRows > 0 Then
+            Dim sumDocAddr As String
+            sumDocAddr = wsD.Range(wsD.Cells(startRow, dstSumDocCol), wsD.Cells(endRow, dstSumDocCol)).Address(False, False)
+            wsD.Cells(itogoRow, dstSumDocCol).FormulaLocal = "=СУММ(" & sumDocAddr & ")"
+            Private_Log "Итого по 'Сумма по документу' -> " & wsD.Cells(itogoRow, dstSumDocCol).Address(0, 0) & " по " & sumDocAddr
+        Else
+            wsD.Cells(itogoRow, dstSumDocCol).Value = 0
+        End If
+        wsD.Cells(itogoRow, dstSumDocCol).NumberFormat = NUM_FMT
+    End If
+    
+    ' Итого под "Расхождение"/"Отклонение"
+    If dstDiffCol > 0 Then
+        If srcRows > 0 Then
+            Dim diffAddr As String
+            diffAddr = wsD.Range(wsD.Cells(startRow, dstDiffCol), wsD.Cells(endRow, dstDiffCol)).Address(False, False)
+            wsD.Cells(itogoRow, dstDiffCol).FormulaLocal = "=СУММ(" & diffAddr & ")"
+            Private_Log "Итого по 'Расхождение' -> " & wsD.Cells(itogoRow, dstDiffCol).Address(0, 0) & " по " & diffAddr
+        Else
+            wsD.Cells(itogoRow, dstDiffCol).Value = 0
+        End If
+        wsD.Cells(itogoRow, dstDiffCol).NumberFormat = NUM_FMT
+    End If
+    
+    Private_Log "Готово. Строк вставлено: " & srcRows & "; время=" & Format$(Timer - t0, "0.00") & " c"
+    
+    
+    
+    GoTo Cleanup
+
+
+ErrHandler:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+
+
+Cleanup:
+    Private_EnvOn
+End Sub
+
+
+'============================== ВСПОМОГАТЕЛЬНЫЕ =================================
+
+
+Private Function Private_FindInColumn(ByVal ws As Worksheet, ByVal colIndex As Long, ByVal whatText As String, ByVal howLook As XlLookAt) As Range
+    On Error Resume Next
+    Set Private_FindInColumn = ws.Columns(colIndex).Find(What:=whatText, _
+        After:=ws.Cells(ws.rows.count, colIndex), LookIn:=xlValues, LookAt:=howLook, _
+        SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+End Function
+
+
+Private Function Private_FindBelow(ByVal ws As Worksheet, ByVal colIndex As Long, ByVal startRow As Long, ByVal whatText As String, ByVal howLook As XlLookAt) As Range
+    Dim rng As Range, c As Range
+    On Error Resume Next
+    Set rng = ws.Range(ws.Cells(startRow, colIndex), ws.Cells(ws.rows.count, colIndex))
+    If Not rng Is Nothing Then
+        Set c = rng.Find(What:=whatText, After:=rng.Cells(rng.Cells.count), LookIn:=xlValues, _
+                         LookAt:=howLook, SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    End If
+    Set Private_FindBelow = c
+    On Error GoTo 0
+End Function
+
+
+Private Sub Private_GetHeaderBounds(ByVal ws As Worksheet, ByVal headerRow As Long, ByRef leftCol As Long, ByRef rightCol As Long)
+    Dim lastUsedCol As Long, c As Long
+    leftCol = 0: rightCol = 0
+    lastUsedCol = ws.Cells(headerRow, ws.Columns.count).End(xlToLeft).Column
+    For c = 1 To lastUsedCol
+        If LenB(ws.Cells(headerRow, c).Value) > 0 Then
+            leftCol = c
+            Exit For
+        End If
+    Next c
+    If lastUsedCol < 1 Then Exit Sub
+    For c = lastUsedCol To 1 Step -1
+        If LenB(ws.Cells(headerRow, c).Value) > 0 Then
+            rightCol = c
+            Exit For
+        End If
+    Next c
+End Sub
+
+
+Private Sub Private_ClearAllBorders(ByVal r As Range)
+    On Error Resume Next
+    r.Borders(xlEdgeTop).LineStyle = xlNone
+    r.Borders(xlEdgeBottom).LineStyle = xlNone
+    r.Borders(xlEdgeLeft).LineStyle = xlNone
+    r.Borders(xlEdgeRight).LineStyle = xlNone
+    r.Borders(xlInsideVertical).LineStyle = xlNone
+    r.Borders(xlInsideHorizontal).LineStyle = xlNone
+    On Error GoTo 0
+End Sub
+
+
+Private Sub Private_DrawOuterThickBorder(ByVal r As Range)
+    With r.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With r.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With r.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With r.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+End Sub
+
+
+Private Function Private_GetSheet(ByVal name As String) As Worksheet
+    On Error Resume Next
+    Set Private_GetSheet = ThisWorkbook.Worksheets(name)
+    On Error GoTo 0
+End Function
+
+
+Private Sub Private_Log(ByVal msg As String)
+    Dim ws As Worksheet, r As Long
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("Логи")
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = "Логи"
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.rows.count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Итоговая_вставка v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Sub Private_EnvOff()
+    On Error Resume Next
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    On Error GoTo 0
+    Private_Log "Окружение: ScreenUpdating=False, Events=False, Alerts=False, Calc=Manual."
+End Sub
+
+
+Private Sub Private_EnvOn()
+    On Error Resume Next
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    On Error GoTo 0
+    Private_Log "Окружение восстановлено."
+End Sub

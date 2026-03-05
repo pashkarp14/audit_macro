@@ -1,0 +1,457 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modNTRC_ExtractPopulation
+' Версия:    1.1.0  (22.09.2025)
+'
+' Что нового в 1.1.0:
+'   - Эталонный выбор источников популяции: ЛИБО базовый лист, ЛИБО части "_Ч…"
+'     (не смешиваем схемы).
+'   - Добавлена функция "Допуск по своей метке" -> NP_ДопускПоСвоейМетке:
+'       Протестировано? пусто ИЛИ содержит метку этого теста — строка допускается.
+'   - Логи дополнены явным описанием условий отбора.
+'
+' Назначение (как в 1.0.0):
+'   1) На листе "8. Нетипичные корреспонденции" в зоне Свод всех проводок>>>...Итого
+'      собрать значения "Проводка", чьи ячейки закрашены (любой цвет ≠ No Fill).
+'   2) На всех листах популяции ("Популяция для тестирования", "Популяция для тестирования_Ч*")
+'      найти строки, где "Проводка" ∈ собранному множеству и "Протестировано?" проходит допуск.
+'   3) Скопировать такие строки целиком на лист "Нетипичные популяция" с сохранением форматов.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.1.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' ---------------- Приёмник-зона с раскрашенными проводками ----------------
+Private Const NTRC_SHEET       As String = "8. Нетипичные корреспонденции"
+Private Const NTRC_ANCHOR_COL  As Long = 2
+Private Const NTRC_ANCHOR_TEXT As String = "Свод всех проводок>>>"
+Private Const TOTAL_TEXT       As String = "Итого"
+
+
+' ---------------- Популяции-источники ----------------
+Private Const POP_BASE      As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF As String = "_Ч"
+
+
+' ---------------- Итоговый лист ----------------
+Private Const OUT_SHEET As String = "Нетипичные популяция"
+
+
+' ---------------- Прогресс-чанк ----------------
+Private Const PROGRESS_SCAN As Long = 100000
+
+
+' ---------------- Метка теста и допуск по своей метке ----------------
+Private Const OWN_TEST_LABEL As String = "См. нетипичные корреспонденции"
+Private Const INCLUDE_OWN_MARKED As Boolean = True   ' True: пусто ИЛИ содержит OWN_TEST_LABEL
+
+
+' Временные переменные шага
+Private curStep As String
+Private stepT As Double
+
+
+'========================================================================================
+' ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Собрать_Нетипичные_Популяция()
+    Dim t0 As Double: t0 = Timer
+    NP_LogWrite "Старт Собрать_Нетипичные_Популяция v" & MODULE_VERSION
+    NP_LogWrite "Условия: Проводка ∈ выделенным; Tested пусто " & _
+                IIf(INCLUDE_OWN_MARKED, "ИЛИ содержит '" & OWN_TEST_LABEL & "'", "(только пусто)")
+
+
+    Dim appCalc As XlCalculation, scrUp As Boolean, evt As Boolean, alr As Boolean
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    ' ---------------- 1) Собрать раскрашенные проводки из "8. Нетипичные корреспонденции"
+    NP_StartStep "Сбор раскрашенных проводок с приёмника"
+    Dim wsN As Worksheet: Set wsN = ThisWorkbook.Worksheets(NTRC_SHEET)
+
+
+    Dim nAnchorRow As Long
+    nAnchorRow = NP_FindAnchorRow(wsN, NTRC_ANCHOR_COL, NTRC_ANCHOR_TEXT)
+    If nAnchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & NTRC_ANCHOR_TEXT & "' на '" & NTRC_SHEET & "'."
+
+
+    Dim nHdrRow As Long, nDataTop As Long, nTotalRow As Long, nDataBottom As Long
+    nHdrRow = nAnchorRow + 1
+    nDataTop = nHdrRow + 1
+    nTotalRow = NP_FindBelowExact(wsN, NTRC_ANCHOR_COL, TOTAL_TEXT, nDataTop)
+    If nTotalRow = 0 Or nTotalRow <= nDataTop Then Err.Raise 5, , "Не найдена строка 'Итого' на '" & NTRC_SHEET & "'."
+    nDataBottom = nTotalRow - 1
+
+
+    Dim mapN As Object: Set mapN = NP_BuildHeaderMap(wsN, nHdrRow)
+    Dim colDocN As Long: colDocN = NP_FindHeader(mapN, Array("проводка"))
+    If colDocN = 0 Then Err.Raise 5, , "На '" & NTRC_SHEET & "' не найдена колонка 'Проводка'."
+
+
+    Dim setDocs As Object: Set setDocs = CreateObject("Scripting.Dictionary"): setDocs.CompareMode = 0
+
+
+    Dim r As Long, vDoc As String, coloredCount As Long
+    If nDataBottom >= nDataTop Then
+        For r = nDataTop To nDataBottom
+            If wsN.Cells(r, colDocN).Interior.ColorIndex <> xlColorIndexNone Then
+                vDoc = NP_NormKey(CStr(wsN.Cells(r, colDocN).Value))
+                If Len(vDoc) > 0 Then
+                    If Not setDocs.Exists(vDoc) Then setDocs(vDoc) = True
+                    coloredCount = coloredCount + 1
+                End If
+            End If
+            If (r - nDataTop + 1) Mod PROGRESS_SCAN = 0 Then
+                NP_LogWrite "... просмотрено строк: " & (r - nDataTop + 1) & "; выделенных: " & coloredCount & "; уник. проводок: " & setDocs.Count
+            End If
+        Next r
+    End If
+
+
+    NP_LogWrite "? Приёмник: выделено ячеек=" & coloredCount & "; уникальных проводок=" & setDocs.Count
+    NP_EndStep
+
+
+    ' Если нет выделенных — просто очистим лист результата
+    NP_StartStep "Подготовка листа результата"
+    Dim wsOut As Worksheet: Set wsOut = NP_EnsureSheet(OUT_SHEET)
+    wsOut.Cells.Clear
+    NP_EndStep
+
+
+    If setDocs.Count = 0 Then
+        NP_LogWrite "Нет раскрашенных проводок — выход без копирования. Время, сек: " & Format$(Timer - t0, "0.000")
+        GoTo Tidy
+    End If
+
+
+    ' ---------------- 2) Обойти листы популяции
+    NP_StartStep "Поиск источников популяции (база ИЛИ части)"
+    Dim popSheets As Collection: Set popSheets = NP_GetPopulationSheets()
+    If popSheets Is Nothing Or popSheets.Count = 0 Then Err.Raise 5, , "Листы популяции не найдены."
+    NP_LogWrite "Найдено листов популяции: " & popSheets.Count
+    NP_EndStep
+
+
+    NP_StartStep "Копирование строк на лист результата (с сохранением форматов)"
+    Dim ws As Worksheet, outNextRow As Long: outNextRow = 1
+    Dim headerCopied As Boolean: headerCopied = False
+    Dim totalCopied As Long: totalCopied = 0
+
+
+    For Each ws In popSheets
+        Dim mapS As Object: Set mapS = NP_BuildHeaderMap(ws, 1)
+
+
+        Dim colDocS As Long, colTested As Long
+        colDocS = NP_FindHeader(mapS, Array("проводка"))
+        colTested = NP_FindHeader(mapS, Array("протестировано?", "tested", "obs flag", "обс?"))
+
+
+        If colDocS = 0 Or colTested = 0 Then
+            NP_LogWrite "Пропуск '" & ws.Name & "': нет нужных колонок (Проводка/Протестировано?)."
+            GoTo NextSheet
+        End If
+
+
+        Dim lastRowS As Long: lastRowS = NP_LastDataRow(ws, colDocS)
+        If lastRowS < 2 Then GoTo NextSheet
+
+
+        ' Шапка: копируем один раз из первого источника
+        If Not headerCopied Then
+            Dim lastColS As Long: lastColS = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+            ws.Range(ws.Cells(1, 1), ws.Cells(1, lastColS)).Copy
+            wsOut.Cells(outNextRow, 1).PasteSpecial xlPasteAll
+            outNextRow = outNextRow + 1
+            headerCopied = True
+            Application.CutCopyMode = False
+        End If
+
+
+        ' Диапазоны значений для фильтра
+        Dim rngDoc As Range, rngTest As Range
+        Set rngDoc = ws.Range(ws.Cells(2, colDocS), ws.Cells(lastRowS, colDocS))
+        Set rngTest = ws.Range(ws.Cells(2, colTested), ws.Cells(lastRowS, colTested))
+
+
+        Dim vD As Variant, vT As Variant
+        vD = rngDoc.Value2
+        vT = rngTest.Value2
+
+
+        Dim i As Long, srcLastCol As Long
+        srcLastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+
+        For i = 1 To UBound(vD, 1)
+            vDoc = NP_NormKey(CStr(vD(i, 1)))
+            If Len(vDoc) > 0 Then
+                If setDocs.Exists(vDoc) Then
+                    ' --- ДОПУСК ПО СВОЕЙ МЕТКЕ ---
+                    If NP_ДопускПоСвоейМетке(vT(i, 1), INCLUDE_OWN_MARKED, OWN_TEST_LABEL) Then
+                        ' Копируем строку i+1 (учёт заголовка) целиком по ширине шапки источника
+                        ws.Range(ws.Cells(i + 1, 1), ws.Cells(i + 1, srcLastCol)).Copy
+                        wsOut.Cells(outNextRow, 1).PasteSpecial xlPasteAll
+                        outNextRow = outNextRow + 1
+                        totalCopied = totalCopied + 1
+                        Application.CutCopyMode = False
+                    End If
+                End If
+            End If
+
+
+            If (i Mod PROGRESS_SCAN) = 0 Then
+                NP_LogWrite "... " & ws.Name & ": просмотрено " & i & " / " & (lastRowS - 1) & _
+                            "; всего скопировано: " & totalCopied
+            End If
+        Next i
+
+
+NextSheet:
+    Next ws
+
+
+    NP_LogWrite "Готово. Скопировано строк: " & totalCopied & ". Время, сек: " & Format$(Timer - t0, "0.000")
+    NP_EndStep
+    GoTo Tidy
+
+
+EH:
+    NP_LogWrite "ОШИБКА: " & Err.Number & " — " & Err.Description
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+End Sub
+
+
+'========================================================================================
+' ХЕЛПЕРЫ
+'========================================================================================
+
+
+Private Function NP_EnsureSheet(ByVal name As String) As Worksheet
+    On Error Resume Next
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(name)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = name
+    End If
+    Set NP_EnsureSheet = ws
+End Function
+
+
+' Эталонная логика: либо базовый лист, либо части "_Ч…", но не обе схемы сразу
+Private Function NP_GetPopulationSheets() As Collection
+    Dim col As New Collection, sh As Worksheet, foundBase As Boolean
+
+
+    For Each sh In ThisWorkbook.Worksheets
+        If sh.Name = POP_BASE Then
+            col.Add sh
+            foundBase = True
+            Exit For
+        End If
+    Next sh
+
+
+    If foundBase Then
+        Set NP_GetPopulationSheets = col
+        Exit Function
+    End If
+
+
+    For Each sh In ThisWorkbook.Worksheets
+        If Left$(sh.Name, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+
+
+    Set NP_GetPopulationSheets = col
+End Function
+
+
+Private Function NP_FindAnchorRow(ByVal ws As Worksheet, ByVal searchCol As Long, ByVal anchorText As String) As Long
+    On Error Resume Next
+    Dim f As Range
+    Set f = ws.Columns(searchCol).Find(What:=anchorText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        NP_FindAnchorRow = 0
+    Else
+        NP_FindAnchorRow = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+Private Function NP_FindBelowExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    On Error Resume Next
+    Dim f As Range
+    Set f = ws.Range(ws.Cells(minRow, col), ws.Cells(ws.Rows.Count, col)).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        NP_FindBelowExact = 0
+    Else
+        NP_FindBelowExact = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+' Построить карту шапки: нормализованное имя -> индекс колонки
+Private Function NP_BuildHeaderMap(ByVal ws As Worksheet, ByVal hdrRow As Long) As Object
+    On Error GoTo EH
+    Dim map As Object: Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = 0
+
+
+    If ws Is Nothing Or hdrRow < 1 Then GoTo OutOk
+
+
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then GoTo OutOk
+
+
+    Dim c As Long, key As String
+    For c = 1 To lastCol
+        key = NP_NormHdr(CStr(ws.Cells(hdrRow, c).Value))
+        If Len(key) > 0 Then
+            If Not map.Exists(key) Then map(key) = c
+        End If
+    Next c
+
+
+OutOk:
+    Set NP_BuildHeaderMap = map
+    Exit Function
+
+
+EH:
+    Set NP_BuildHeaderMap = map
+End Function
+
+
+Private Function NP_FindHeader(ByVal hdrMap As Object, ByVal syns As Variant) As Long
+    On Error Resume Next
+    Dim i As Long, k As String
+    If hdrMap Is Nothing Then Exit Function
+    For i = LBound(syns) To UBound(syns)
+        k = NP_NormHdr(CStr(syns(i)))
+        If hdrMap.Exists(k) Then
+            NP_FindHeader = CLng(hdrMap(k))
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Function NP_LastDataRow(ByVal ws As Worksheet, ByVal col As Long) As Long
+    On Error Resume Next
+    Dim lr As Long
+    lr = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+    If lr < 2 Then lr = 2
+    NP_LastDataRow = lr
+End Function
+
+
+Private Function NP_IsEmptyOrTrimEmpty(ByVal v As Variant) As Boolean
+    Dim s As String
+    If IsEmpty(v) Then NP_IsEmptyOrTrimEmpty = True: Exit Function
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    NP_IsEmptyOrTrimEmpty = (LenB(Trim$(s)) = 0)
+End Function
+
+
+Private Function NP_NormHdr(ByVal s As String) As String
+    s = Replace$(s, ChrW(160), " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NP_NormHdr = LCase$(s)
+End Function
+
+
+Private Function NP_NormKey(ByVal s As String) As String
+    s = Replace$(s, ChrW(160), " ")
+    s = Trim$(s)
+    NP_NormKey = s
+End Function
+
+
+' --- ДОПУСК ПО СВОЕЙ МЕТКЕ ---
+' True, если "Протестировано?" ПУСТО
+' ИЛИ (если includeOwn=True) содержит ownLabel (без учёта регистра, обрезанные пробелы).
+Private Function NP_ДопускПоСвоейМетке(ByVal v As Variant, ByVal includeOwn As Boolean, ByVal ownLabel As String) As Boolean
+    If NP_IsEmptyOrTrimEmpty(v) Then
+        NP_ДопускПоСвоейМетке = True
+        Exit Function
+    End If
+    If includeOwn Then
+        Dim s As String
+        On Error Resume Next: s = CStr(v): On Error GoTo 0
+        s = Trim$(s)
+        If LenB(s) > 0 Then
+            If InStr(1, s, ownLabel, vbTextCompare) > 0 Then
+                NP_ДопускПоСвоейМетке = True
+                Exit Function
+            End If
+        End If
+    End If
+End Function
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+Private Sub NP_LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub NP_StartStep(ByVal stepName As String)
+    curStep = stepName
+    stepT = Timer
+    NP_LogWrite Format$(Now, "dd.mm.yyyy HH:nn") & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub NP_EndStep()
+    NP_LogWrite Format$(Now, "dd.mm.yyyy HH:nn") & vbTab & "<< " & curStep & _
+                "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    curStep = vbNullString
+End Sub

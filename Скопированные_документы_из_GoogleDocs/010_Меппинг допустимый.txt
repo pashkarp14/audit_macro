@@ -1,0 +1,115 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Модуль:    modMapping_Common
+' Версия:    1.1.2  (16.09.2025)
+'
+' Что нового в 1.1.2:
+'   - Исправлено: ошибка "Too many line continuations".
+'     Список AllowedMappings формируется через Split одной строки (без переносов).
+'
+' Что нового в 1.1.1:
+'   - Добавлено правило: "Нулевая№Я сумма" -> "Проводка с нулевой суммой".
+'
+' Что нового в 1.1.0:
+'   - "Курсовые разницы" -> "Переоценка валютных остатков".
+'   - "Взаимозачёт"      -> "Взаимозачет встречных требований".
+'   - "Взаимозачёт" добавлен в список допустимых меппингов.
+'===============================================================================
+
+
+Private Const MODULE_VERSION As String = "1.1.2"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+'------------------------- Канонизация ключа меппинга --------------------------
+Public Function CanonMapKeyCommon(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, "—", "-")
+    s = Replace$(s, "–", "-")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    CanonMapKeyCommon = LCase$(s)
+End Function
+
+
+'---------------------- Меппинг (отображаемый) -> Обоснование -------------------
+Public Function MapToReason(ByVal mapDisp As String) As String
+    Static d As Object
+    If d Is Nothing Then
+        Set d = CreateObject("Scripting.Dictionary")
+        d.CompareMode = vbTextCompare
+
+
+        d.Add CanonMapKeyCommon("Налоги"), "Типовые проводки по налогам"
+        d.Add CanonMapKeyCommon("Налоговые активы"), "Типовые проводки по ОНА"
+        d.Add CanonMapKeyCommon("Налоговые обязательства"), "Типовые проводки по ОНО"
+        d.Add CanonMapKeyCommon("Соц. взносы"), "Соц. взносы"
+        d.Add CanonMapKeyCommon("Внутренний оборот"), "Внутренний оборот"
+        d.Add CanonMapKeyCommon("Внутренние движения по ОС"), "Внутренние движения по ОС"
+        d.Add CanonMapKeyCommon("Внутренние движения по НМА"), "Внутренние движения по НМА"
+        d.Add CanonMapKeyCommon("Начисление процентов"), "Начисление процентов"
+        d.Add CanonMapKeyCommon("Амортизация"), "Типовые проводки по амортизации"
+        d.Add CanonMapKeyCommon("Денежные средства"), "Обороты внутри счетов денежных средств"
+        d.Add CanonMapKeyCommon("Оплата труда"), "Оплата труда"
+        d.Add CanonMapKeyCommon("Реформация/финрезультат"), "Реформация и формирование фин. результата"
+        d.Add CanonMapKeyCommon("Резервы"), "Резервы"
+        d.Add CanonMapKeyCommon("Списание материалов"), "Списание материальных затрат"
+        d.Add CanonMapKeyCommon("Затраты/ГП — внутри"), "Внутренние проводки между счетами затрат и ГП"
+        d.Add CanonMapKeyCommon("Забалансовые операции"), "Забалансовые операции"
+        d.Add CanonMapKeyCommon("Внутри запасов"), "Операции внутри счетов запасов"
+        d.Add CanonMapKeyCommon("Расчёты / Взаимозачёт"), "Взаимозачет встречных требований или Операции внутри счетов расчетов"
+        d.Add CanonMapKeyCommon("Списание РБП"), "Списание РБП"
+        d.Add CanonMapKeyCommon("Списание расходов"), "Списание расходов"
+        d.Add CanonMapKeyCommon("Популяция для тестирования"), "Н.п."
+        d.Add CanonMapKeyCommon("Курсовые разницы"), "Переоценка валютных остатков"
+        d.Add CanonMapKeyCommon("Взаимозачёт"), "Взаимозачет встречных требований"
+        d.Add CanonMapKeyCommon("Нулевая сумма"), "Проводка с нулевой суммой"
+    End If
+
+
+    Dim key As String: key = CanonMapKeyCommon(mapDisp)
+    If d.Exists(key) Then
+        MapToReason = CStr(d(key))
+    Else
+        MapToReason = ""
+    End If
+End Function
+
+
+'------------------------ Список допустимых меппингов --------------------------
+' Формируем без Array(...) с переносами, чтобы не упираться в лимит 24 continuation.
+Public Function AllowedMappings() As Variant
+    Dim s As String
+    s = "Налоги|Налоговые активы|Налоговые обязательства|Соц. взносы|" & _
+        "Внутренний оборот|Внутренние движения по ОС|Внутренние движения по НМА|" & _
+        "Начисление процентов|Амортизация|Денежные средства|Оплата труда|" & _
+        "Реформация/финрезультат|Резервы|Списание материалов|Затраты/ГП — внутри|" & _
+        "Забалансовые операции|Внутри запасов|Расчёты / Взаимозачёт|Списание РБП|" & _
+        "Списание расходов|Популяция для тестирования|Курсовые разницы|Взаимозачёт|" & _
+        "Нулевая сумма|Н.п."
+    AllowedMappings = Split(s, "|")
+End Function
+
+
+'------------------------------- Логи (private) --------------------------------
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Mapping_Common v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub

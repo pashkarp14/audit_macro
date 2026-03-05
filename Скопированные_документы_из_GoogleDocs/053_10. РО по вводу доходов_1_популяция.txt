@@ -1,0 +1,427 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modOps_ManualWithRelated
+' Версия:    2.4.0  (22.09.2025)
+'
+' Что нового в 2.4.0:
+'   - ИСПРАВЛЕНО: при повторных запусках строки, уже отмеченные для этого теста
+'     в популяции (колонка "Протестировано?" содержит "См. РО по вводу доходов"),
+'     снова попадают в выборку. Раньше отбирались только пустые — из-за этого
+'     повторный прогон "терял" ранее отмеченные строки.
+'   - Добавлен переключатель INCLUDE_OWN_MARKED (True по умолчанию).
+'   - Расширено логирование условий отбора и итогов по каждому листу.
+'
+' Ключевые моменты (как и ранее):
+'   - Копирование ПОСТРОЧНО A..last (xlPasteAll) — для полного сохранения форматов.
+'   - На каждом листе популяции ищем индексы "Документ"/"Протестировано?"/"Счет Кт".
+'   - Приёмник: "РО по вводу доходов популяция", вставка с A1 (шапка — строка 1).
+'
+' Условия отбора:
+'   • "Протестировано?" — ПУСТО ИЛИ (если INCLUDE_OWN_MARKED=True) содержит OWN_TEST_LABEL;
+'   • "Документ" содержит "операци" и НЕ содержит "регламентн";
+'   • "Счет Кт" = 90.01 или начинается с 91 (включая 91.xx; исключая 910…).
+'========================================================================================
+
+
+Private Const MacroVersion As String = "2.4.0"
+Private Const LOG_SHEET    As String = "Логи"
+
+
+' Источник (популяции): либо один базовый, либо несколько частей
+Private Const POP_BASE      As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF As String = "_Ч"
+
+
+' Приёмник
+Private Const DST_SHEET_OUT As String = "РО по вводу доходов популяция"
+
+
+' Метка именно ЭТОГО теста (должна совпадать с модулем-маркером)
+Private Const OWN_TEST_LABEL As String = "См. РО по вводу доходов"
+
+
+' Включать ли строки, уже отмеченные для ЭТОГО теста в колонке "Протестировано?"
+' True — БРАТЬ пустые ИЛИ содержащие OWN_TEST_LABEL; False — БРАТЬ ТОЛЬКО пустые.
+Private Const INCLUDE_OWN_MARKED As Boolean = True
+
+
+' ---------- Синонимы шапок ----------
+Private Function SynDoc() As Variant
+    SynDoc = Array("Документ", " документ", "документ ", "Описание", "Наименование документа")
+End Function
+
+
+Private Function SynTested() As Variant
+    SynTested = Array("Протестировано?", " протестировано?", "протестировано? ", "Протестировано", " протестировано", "протестировано ")
+End Function
+
+
+Private Function SynAccCr() As Variant
+    SynAccCr = Array("Счет Кт", " счет кт", "счет кт ", "счет кр", "счет кредита", "Кредит", "Кредит счет")
+End Function
+
+
+Private Function SynSum() As Variant
+    SynSum = Array("Сумма", " сумма", "сумма ", "Сумма абс", "Сумма абс.", "Сумма абсолютная", "Сумма (абс)")
+End Function
+
+
+'========================================================================================
+' ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Заполнить_РО_по_вводу_доходов_популяция()
+    Dim t0 As Double: t0 = Timer
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+    Dim errContext As String
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    On Error GoTo EH
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite OS_NowStr() & vbTab & "Старт" & vbTab & _
+            "Заполнить_РО_по_вводу_доходов_популяция v" & MacroVersion
+    LogWrite "Условия: Tested пусто " & IIf(INCLUDE_OWN_MARKED, "ИЛИ содержит '" & OWN_TEST_LABEL & "'", "(без учёта своей метки)") & _
+            "; Doc содержит 'операци' и НЕ содержит 'регламентн'; Кт = 90.01 или 91/91.xx"
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    ' ---------- Листы популяции ----------
+    errContext = "Поиск листов популяции"
+    Dim tStep As Double: tStep = StepStart("Поиск листов популяции (base ИЛИ parts)")
+    Dim popSheets As Collection
+    Set popSheets = OS_GetPopulationSheets(wb)
+    If popSheets Is Nothing Or popSheets.count = 0 Then Err.Raise 5, , "Листы популяции не найдены"
+    LogWrite OS_NowStr() & vbTab & "Найдено листов популяции" & vbTab & popSheets.count
+    StepEnd "Поиск листов популяции (base ИЛИ parts)", tStep
+
+
+    ' ---------- Образец шапки ----------
+    errContext = "Определение шапки образца"
+    tStep = StepStart("Определение шапки образца")
+    Dim wsSample As Worksheet: Set wsSample = popSheets(1)
+    Dim lastColSample As Long
+    lastColSample = wsSample.Cells(1, wsSample.Columns.count).End(xlToLeft).Column
+    LogWrite OS_NowStr() & vbTab & "Шапка образца: колонок=" & lastColSample
+    StepEnd "Определение шапки образца", tStep
+
+
+    ' ---------- Приёмник ----------
+    errContext = "Очистка приёмника и вывод шапки"
+    tStep = StepStart(errContext)
+    Dim wsDst As Worksheet
+    Set wsDst = OS_EnsureSheet(wb, DST_SHEET_OUT)
+    wsDst.Cells.Clear
+
+
+    ' Шапка A..last
+    wsSample.Range(wsSample.Cells(1, 1), wsSample.Cells(1, lastColSample)).Copy
+    wsDst.Cells(1, 1).PasteSpecial xlPasteAll
+    Application.CutCopyMode = False
+
+
+    ' Ширины по образцу
+    Dim j As Long
+    For j = 1 To lastColSample
+        wsDst.Columns(j).ColumnWidth = wsSample.Columns(j).ColumnWidth
+    Next j
+    StepEnd errContext, tStep
+
+
+    ' ---------- Отбор и копирование построчно ----------
+    errContext = "Отбор и копирование построчно"
+    tStep = StepStart(errContext)
+    Dim totalOut As Long: totalOut = 0
+    Dim dstRow As Long: dstRow = 2
+
+
+    Dim shIdx As Long
+    For shIdx = 1 To popSheets.count
+        Dim ws As Worksheet: Set ws = popSheets(shIdx)
+
+
+        ' Индексы нужных колонок ищем на КАЖДОМ листе
+        Dim hdrDoc As String, hdrTested As String, hdrAccCr As String, hdrSum As String
+        Dim cDoc As Long, cTested As Long, cAccCr As Long, cSum As Long
+
+
+        cDoc = OS_FindHeaderSyn(ws, SynDoc(), 1, hdrDoc)
+        cTested = OS_FindHeaderSyn(ws, SynTested(), 1, hdrTested)
+        cAccCr = OS_FindHeaderSyn(ws, SynAccCr(), 1, hdrAccCr)
+        cSum = OS_FindHeaderSyn(ws, SynSum(), 1, hdrSum)    ' опционально
+
+
+        If cDoc = 0 Or cTested = 0 Or cAccCr = 0 Then
+            LogWrite OS_NowStr() & vbTab & "Пропуск листа (нет нужных колонок): " & ws.name
+            GoTo NextSheet
+        End If
+
+
+        Dim lr As Long
+        lr = OS_LastDataRowOnCols(ws, Array(cDoc, cTested, cAccCr))
+        If lr < 2 Then GoTo NextSheet
+
+
+        Dim r As Long, copiedHere As Long: copiedHere = 0
+        For r = 2 To lr
+            If OS_AcceptTestedCell(ws.Cells(r, cTested).Value, INCLUDE_OWN_MARKED, OWN_TEST_LABEL) Then
+                Dim docText As String: docText = CStr(ws.Cells(r, cDoc).Value)
+                If OS_TextContainsCI(docText, "операци") Then
+                    If Not OS_TextContainsSubstrCI(docText, "регламентн") Then
+                        If OS_AcceptAccCr(CStr(ws.Cells(r, cAccCr).Value)) Then
+                            ' Копируем РОВНО одну строку A..lastColSample
+                            ws.Range(ws.Cells(r, 1), ws.Cells(r, lastColSample)).Copy
+                            wsDst.Cells(dstRow, 1).PasteSpecial xlPasteAll
+                            Application.CutCopyMode = False
+
+
+                            dstRow = dstRow + 1
+                            totalOut = totalOut + 1
+                            copiedHere = copiedHere + 1
+                        End If
+                    End If
+                End If
+            End If
+
+
+            If (r Mod 200000) = 0 Then DoEvents
+        Next r
+
+
+        LogWrite OS_NowStr() & vbTab & "Лист " & ws.name & ": скопировано строк=" & copiedHere
+        
+
+
+
+
+NextSheet:
+    Next shIdx
+
+
+    StepEnd errContext, tStep
+
+
+    LogWrite OS_NowStr() & vbTab & "Готово" & vbTab & _
+        "Строк всего вставлено=" & totalOut & "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite OS_NowStr() & vbTab & "Ошибка" & vbTab & _
+        "Этап='" & errContext & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'========================================================================================
+' ХЕЛПЕРЫ
+'========================================================================================
+
+
+' Либо один базовый лист, либо набор частей — НЕ смешиваем. Если есть BASE — берём только его.
+Private Function OS_GetPopulationSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection, sh As Worksheet, foundBase As Boolean
+    foundBase = False
+    For Each sh In wb.Worksheets
+        If sh.name = POP_BASE Then
+            col.Add sh
+            foundBase = True
+            Exit For
+        End If
+    Next sh
+    If foundBase Then
+        Set OS_GetPopulationSheets = col
+        Exit Function
+    End If
+
+
+    For Each sh In wb.Worksheets
+        If Left$(sh.name, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+    Set OS_GetPopulationSheets = col
+End Function
+
+
+Private Function OS_FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant, ByVal hdrRow As Long, _
+                                  ByRef matchedHeader As String) As Long
+    Dim lastCol As Long, c As Long, i As Long, head As String
+    matchedHeader = ""
+    lastCol = ws.Cells(hdrRow, ws.Columns.count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        head = OS_NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                If head = OS_NormalizeHeaderText(CStr(syns(i))) Then
+                    matchedHeader = CStr(ws.Cells(hdrRow, c).Value)
+                    OS_FindHeaderSyn = c
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next c
+End Function
+
+
+Private Function OS_LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long: lr = 0
+    Dim j As Long, lrj As Long, c As Long
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.rows.count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    OS_LastDataRowOnCols = lr
+End Function
+
+
+Private Function OS_NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    OS_NormalizeHeaderText = LCase$(s)
+End Function
+
+
+Private Function OS_IsEmptyOrTrimEmpty(ByVal v As Variant) As Boolean
+    Dim s As String
+    If IsEmpty(v) Then OS_IsEmptyOrTrimEmpty = True: Exit Function
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    s = Trim$(s)
+    OS_IsEmptyOrTrimEmpty = (LenB(s) = 0)
+End Function
+
+
+' "Протестировано?": True если пусто
+' или (если includeOwn=True) содержит OWN_TEST_LABEL (без учёта регистра/пробелов по краям)
+Private Function OS_AcceptTestedCell(ByVal v As Variant, ByVal includeOwn As Boolean, ByVal ownLabel As String) As Boolean
+    If OS_IsEmptyOrTrimEmpty(v) Then
+        OS_AcceptTestedCell = True
+        Exit Function
+    End If
+    If includeOwn Then
+        Dim s As String
+        On Error Resume Next: s = CStr(v): On Error GoTo 0
+        s = Trim$(s)
+        If LenB(s) > 0 Then
+            If InStr(1, s, ownLabel, vbTextCompare) > 0 Then
+                OS_AcceptTestedCell = True
+                Exit Function
+            End If
+        End If
+    End If
+End Function
+
+
+Private Function OS_TextContainsCI(ByVal v As Variant, ByVal token As String) As Boolean
+    Dim s As String
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    OS_TextContainsCI = (InStr(1, s, token, vbTextCompare) > 0)
+End Function
+
+
+Private Function OS_TextContainsSubstrCI(ByVal v As Variant, ByVal tokenSub As String) As Boolean
+    Dim s As String
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    OS_TextContainsSubstrCI = (InStr(1, s, tokenSub, vbTextCompare) > 0)
+End Function
+
+
+' Счет Кт: строго 90.01 или 91 / 91.xxx (но не 910…)
+Private Function OS_AcceptAccCr(ByVal s As String) As Boolean
+    Dim t As String
+    t = CStr(s)
+    t = Replace$(t, " ", "")
+    t = Replace$(t, ",", ".")
+    t = LCase$(t)
+
+
+    If t = "90.01" Then OS_AcceptAccCr = True: Exit Function
+
+
+    If Left$(t, 2) = "91" Then
+        If Len(t) = 2 Then OS_AcceptAccCr = True: Exit Function
+        If Mid$(t, 3, 1) = "." Then OS_AcceptAccCr = True: Exit Function
+    End If
+End Function
+
+
+Private Function OS_EnsureSheet(ByVal wb As Workbook, ByVal sheetName As String) As Worksheet
+    On Error Resume Next
+    Dim ws As Worksheet: Set ws = wb.Worksheets(sheetName)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.count))
+        ws.name = sheetName
+    End If
+    Set OS_EnsureSheet = ws
+End Function
+
+
+'========================================================================================
+' ЛОГ-СИСТЕМА
+'========================================================================================
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.rows.count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Function StepStart(ByVal stepName As String) As Double
+    LogWrite OS_NowStr() & vbTab & ">> " & stepName
+    StepStart = Timer
+End Function
+
+
+Private Sub StepEnd(ByVal stepName As String, ByVal tStart As Double)
+    LogWrite OS_NowStr() & vbTab & "<< " & stepName & "  (" & Format$(Timer - tStart, "0.00") & " сек)"
+End Sub
+
+
+Private Function OS_NowStr() As String
+    OS_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

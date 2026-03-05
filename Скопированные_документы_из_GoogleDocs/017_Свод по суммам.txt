@@ -1,0 +1,703 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modSvod_AccountsSum
+' Версия:    1.1.1  (16.09.2025)
+'
+' Что нового vs 1.0.0:
+'   - Поиск колонки суммы по синонимам: "Сумма", " сумма", "сумма ", "Сумма абс",
+'     "Сумма абс.", "Сумма абсолютная", "Сумма (абс)".
+'   - Детальные логи: какой столбец суммы найден на каждом листе, сколько строк
+'     распознано, итоговые суммы по Дт/Кт.
+'
+' Назначение:
+'   Заполняет своды сумм проводок на листе "По счету":
+'     - Левый якорь (в кол. 2):  "Свод проводок дебет>>>"
+'       Шапка под якорем: "Счет Дт" | "Сумма"
+'     - Правый якорь (в той же строке правее): "Свод проводок кредит>>>"
+'       Шапка под якорем: "Счет Кт" | "Сумма"
+'   Источник: лист(ы) "Популяция для тестирования" и "Популяция для тестирования_Ч*".
+'
+' Правила:
+'   - Перед заполнением очищается область между шапкой и "Итого".
+'   - Если строк не хватает — вставляются доп. ячейки ТОЛЬКО в эти два столбца (ShiftDown).
+'   - В ячейке "Итого" под столбцом "Сумма" — формула СУММ по вставленным строкам.
+'   - Формат суммы: "# ##0;-# ##0;-" (0 показывается как "-").
+'   - Счета выводятся текстом ("@"), чтобы не менять точки на запятые.
+'   - Вставленный блок обводится толстой внешней рамкой.
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.1.1"
+
+
+Private Const SHEET_SUMMARY As String = "По счету"
+Private Const LOG_SHEET     As String = "Логи"
+
+
+Private Const POP_BASE      As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF As String = "_Ч"
+
+
+Private Const ANCHOR_DEBIT  As String = "Свод проводок дебет>>>"
+Private Const ANCHOR_CREDIT As String = "Свод проводок кредит>>>"
+
+
+Private Const HEADER_DEBIT_1  As String = "Счет Дт"
+Private Const HEADER_DEBIT_2  As String = "Сумма"
+Private Const HEADER_CREDIT_1 As String = "Счет Кт"
+Private Const HEADER_CREDIT_2 As String = "Сумма"
+
+
+Private Const NUM_FMT As String = "# ##0;-# ##0;-"
+Private Const ANCHOR_COL As Long = 2
+Private Const HEADER_HEIGHT As Long = 1
+Private Const TOTAL_TEXT As String = "Итого"
+
+
+Private currentStep As String
+Private stepT As Double
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Заполнить_Своды_Сумм()
+    Dim t0 As Double: t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+
+
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt   = Application.EnableEvents
+    alr   = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents   = False
+    Application.DisplayAlerts  = False
+    Application.Calculation    = xlCalculationManual
+
+
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & "Заполнить_Своды_Сумм v" & MacroVersion
+
+
+    ' ---------- Лист "По счету" и якоря ----------
+    StartStep "Поиск листа 'По счету' и якорей"
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(SHEET_SUMMARY)
+    On Error GoTo 0
+    If ws Is Nothing Then Err.Raise 5, , "Лист '" & SHEET_SUMMARY & "' не найден."
+
+
+    Dim debitAnchorRow As Long, creditAnchorCol As Long
+    Dim headerTopDebit As Long, dataTopDebit As Long, totalRowDebit As Long, dataBottomDebit As Long
+
+
+    debitAnchorRow = FindFirstInColumnExact(ws, ANCHOR_COL, ANCHOR_DEBIT)
+    If debitAnchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & ANCHOR_DEBIT & "' в кол. 2"
+
+
+    headerTopDebit  = debitAnchorRow + 1
+    dataTopDebit    = headerTopDebit + HEADER_HEIGHT
+    totalRowDebit   = FindFirstBelowInColumnExact(ws, ANCHOR_COL, TOTAL_TEXT, dataTopDebit)
+    If totalRowDebit = 0 Or totalRowDebit <= dataTopDebit Then Err.Raise 5, , "Метка 'Итого' (Дебет) не найдена ниже шапки"
+    dataBottomDebit = totalRowDebit - 1
+
+
+    creditAnchorCol = FindTextInRowExact(ws, debitAnchorRow, ANCHOR_CREDIT, ANCHOR_COL + 1)
+    If creditAnchorCol = 0 Then Err.Raise 5, , "Не найден якорь '" & ANCHOR_CREDIT & "' правее дебет-якоря"
+
+
+    Dim headerTopCredit As Long, dataTopCredit As Long, totalRowCredit As Long, dataBottomCredit As Long
+    headerTopCredit  = debitAnchorRow + 1
+    dataTopCredit    = headerTopCredit + HEADER_HEIGHT
+    totalRowCredit   = FindFirstBelowInColumnExact(ws, creditAnchorCol, TOTAL_TEXT, dataTopCredit)
+    If totalRowCredit = 0 Or totalRowCredit <= dataTopCredit Then Err.Raise 5, , "Метка 'Итого' (Кредит) не найдена ниже шапки"
+    dataBottomCredit = totalRowCredit - 1
+
+
+    LogWrite NowStr() & vbTab & "? Якоря" & vbTab & _
+        "Дебет: Row=" & debitAnchorRow & ", Col=" & ANCHOR_COL & _
+        " | Кредит: Row=" & debitAnchorRow & ", Col=" & creditAnchorCol
+    EndStep
+
+
+    ' ---------- Сбор источников популяции ----------
+    StartStep "Сканирование листов популяции"
+    Dim popSheets As Collection: Set popSheets = GetPopulationSheets(wb)
+    If popSheets Is Nothing Or popSheets.Count = 0 Then
+        LogWrite NowStr() & vbTab & "Внимание" & vbTab & "Листы популяции не найдены — своды будут очищены"
+    End If
+    EndStep
+
+
+    ' ---------- Агрегация по Дт/Кт (суммы) ----------
+    StartStep "Агрегация сумм по Счет Дт / Счет Кт"
+    Dim dDt As Object, dKt As Object
+    Dim rowsRead As Long, rowsWithSum As Long
+    Set dDt = CreateObject("Scripting.Dictionary"): dDt.CompareMode = vbTextCompare
+    Set dKt = CreateObject("Scripting.Dictionary"): dKt.CompareMode = vbTextCompare
+
+
+    If Not popSheets Is Nothing And popSheets.Count > 0 Then
+        AggregateDebitCreditSums popSheets, dDt, dKt, rowsRead, rowsWithSum
+    End If
+    LogWrite NowStr() & vbTab & "? Агрегация" & vbTab & _
+        "Прочитано строк=" & rowsRead & _
+        "; Строк с распознанной суммой=" & rowsWithSum & _
+        "; Уникальных Дт=" & dDt.Count & _
+        "; Уникальных Кт=" & dKt.Count
+    EndStep
+
+
+    ' ---------- ДЕБЕТ: очистка/подгонка ----------
+    StartStep "ДЕБЕТ: очистка и подгонка строк"
+    ClearRangeBorders ws, ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL), ws.Cells(IIf(dataBottomDebit >= dataTopDebit, dataBottomDebit, dataTopDebit), ANCHOR_COL + 1))
+
+
+    Dim needDebit As Long: needDebit = dDt.Count
+    Dim nRowsDebit As Long: nRowsDebit = dataBottomDebit - dataTopDebit + 1
+    If needDebit < 0 Then needDebit = 0
+
+
+    If nRowsDebit < needDebit Then
+        Dim insD As Long: insD = needDebit - nRowsDebit
+        ws.Range(ws.Cells(totalRowDebit, ANCHOR_COL), ws.Cells(totalRowDebit, ANCHOR_COL + 1)).Resize(insD, 2).Insert xlShiftDown
+        totalRowDebit = totalRowDebit + insD
+        dataBottomDebit = dataTopDebit + needDebit - 1
+        LogWrite NowStr() & vbTab & "ДЕБЕТ: вставлено строк (ячейки в 2 кол.)" & vbTab & insD
+    ElseIf nRowsDebit > needDebit Then
+        Dim delD As Long: delD = nRowsDebit - needDebit
+        If delD > 0 And needDebit >= 0 Then
+            ws.Range(ws.Cells(dataTopDebit + needDebit, ANCHOR_COL), ws.Cells(dataTopDebit + needDebit, ANCHOR_COL + 1)).Resize(delD, 2).Delete xlShiftUp
+            totalRowDebit = totalRowDebit - delD
+            dataBottomDebit = dataTopDebit + needDebit - 1
+            LogWrite NowStr() & vbTab & "ДЕБЕТ: удалено лишних строк (ячейки в 2 кол.)" & vbTab & delD
+        End If
+    Else
+        LogWrite NowStr() & vbTab & "ДЕБЕТ: подгонка строк" & vbTab & "Не требуется"
+    End If
+    EndStep
+
+
+    ' ---------- КРЕДИТ: очистка/подгонка ----------
+    StartStep "КРЕДИТ: очистка и подгонка строк"
+    ClearRangeBorders ws, ws.Range(ws.Cells(dataTopCredit, creditAnchorCol), ws.Cells(IIf(dataBottomCredit >= dataTopCredit, dataBottomCredit, dataTopCredit), creditAnchorCol + 1))
+
+
+    Dim needCredit As Long: needCredit = dKt.Count
+    Dim nRowsCredit As Long: nRowsCredit = dataBottomCredit - dataTopCredit + 1
+    If needCredit < 0 Then needCredit = 0
+
+
+    If nRowsCredit < needCredit Then
+        Dim insK As Long: insK = needCredit - nRowsCredit
+        ws.Range(ws.Cells(totalRowCredit, creditAnchorCol), ws.Cells(totalRowCredit, creditAnchorCol + 1)).Resize(insK, 2).Insert xlShiftDown
+        totalRowCredit = totalRowCredit + insK
+        dataBottomCredit = dataTopCredit + needCredit - 1
+        LogWrite NowStr() & vbTab & "КРЕДИТ: вставлено строк (ячейки в 2 кол.)" & vbTab & insK
+    ElseIf nRowsCredit > needCredit Then
+        Dim delK As Long: delK = nRowsCredit - needCredit
+        If delK > 0 And needCredit >= 0 Then
+            ws.Range(ws.Cells(dataTopCredit + needCredit, creditAnchorCol), ws.Cells(dataTopCredit + needCredit, creditAnchorCol + 1)).Resize(delK, 2).Delete xlShiftUp
+            totalRowCredit = totalRowCredit - delK
+            dataBottomCredit = dataTopCredit + needCredit - 1
+            LogWrite NowStr() & vbTab & "КРЕДИТ: удалено лишних строк (ячейки в 2 кол.)" & vbTab & delK
+        End If
+    Else
+        LogWrite NowStr() & vbTab & "КРЕДИТ: подгонка строк" & vbTab & "Не требуется"
+    End If
+    EndStep
+
+
+    ' ---------- ДЕБЕТ: вывод ----------
+    StartStep "ДЕБЕТ: вывод данных и формулы"
+    If needDebit > 0 Then
+        Dim outD() As Variant: outD = DictToSortedArray2ColsDbl(dDt)
+        ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL), ws.Cells(dataBottomDebit, ANCHOR_COL)).NumberFormat = "@"
+        ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL), ws.Cells(dataBottomDebit, ANCHOR_COL + 1)).Value = outD
+    Else
+        If dataBottomDebit >= dataTopDebit Then
+            ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL), ws.Cells(dataBottomDebit, ANCHOR_COL + 1)).ClearContents
+        End If
+    End If
+
+
+    If dataBottomDebit >= dataTopDebit Then
+        Dim rngSumD As Range
+        Set rngSumD = ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL + 1), ws.Cells(dataBottomDebit, ANCHOR_COL + 1))
+        ws.Cells(totalRowDebit, ANCHOR_COL + 1).FormulaLocal = "=СУММ(" & rngSumD.Address(False, False) & ")"
+    Else
+        ws.Cells(totalRowDebit, ANCHOR_COL + 1).Value = 0
+    End If
+    ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL + 1), ws.Cells(totalRowDebit, ANCHOR_COL + 1)).NumberFormatLocal = NUM_FMT
+
+
+    If dataBottomDebit >= dataTopDebit Then
+        ThickBox ws.Range(ws.Cells(dataTopDebit, ANCHOR_COL), ws.Cells(dataBottomDebit, ANCHOR_COL + 1))
+    End If
+    EndStep
+
+
+    ' ---------- КРЕДИТ: вывод ----------
+    StartStep "КРЕДИТ: вывод данных и формулы"
+    If needCredit > 0 Then
+        Dim outK() As Variant: outK = DictToSortedArray2ColsDbl(dKt)
+        ws.Range(ws.Cells(dataTopCredit, creditAnchorCol), ws.Cells(dataBottomCredit, creditAnchorCol)).NumberFormat = "@"
+        ws.Range(ws.Cells(dataTopCredit, creditAnchorCol), ws.Cells(dataBottomCredit, creditAnchorCol + 1)).Value = outK
+    Else
+        If dataBottomCredit >= dataTopCredit Then
+            ws.Range(ws.Cells(dataTopCredit, creditAnchorCol), ws.Cells(dataBottomCredit, creditAnchorCol + 1)).ClearContents
+        End If
+    End If
+
+
+    If dataBottomCredit >= dataTopCredit Then
+        Dim rngSumK As Range
+        Set rngSumK = ws.Range(ws.Cells(dataTopCredit, creditAnchorCol + 1), ws.Cells(dataBottomCredit, creditAnchorCol + 1))
+        ws.Cells(totalRowCredit, creditAnchorCol + 1).FormulaLocal = "=СУММ(" & rngSumK.Address(False, False) & ")"
+    Else
+        ws.Cells(totalRowCredit, creditAnchorCol + 1).Value = 0
+    End If
+    ws.Range(ws.Cells(dataTopCredit, creditAnchorCol + 1), ws.Cells(totalRowCredit, creditAnchorCol + 1)).NumberFormatLocal = NUM_FMT
+
+
+    If dataBottomCredit >= dataTopCredit Then
+        ThickBox ws.Range(ws.Cells(dataTopCredit, creditAnchorCol), ws.Cells(dataBottomCredit, creditAnchorCol + 1))
+    End If
+    EndStep
+
+
+    ' ---------- Итоговые суммы по словарям (для диагностики) ----------
+    Dim totalDt As Double, totalKt As Double
+    totalDt = SumDictDbl(dDt)
+    totalKt = SumDictDbl(dKt)
+    LogWrite NowStr() & vbTab & "? Контроль сумм" & vbTab & _
+            "Итого по Дт=" & Format$(totalDt, "0.00") & _
+            "; Итого по Кт=" & Format$(totalKt, "0.00")
+
+
+FinishOK:
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & _
+        "Дебет уник. счетов=" & CountSafe(dDt) & "; Кредит уник. счетов=" & CountSafe(dKt) & _
+        "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents   = evt
+    Application.DisplayAlerts  = alr
+    Application.Calculation    = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'============================== АГРЕГАЦИЯ СУММ =================================
+
+
+Private Sub AggregateDebitCreditSums( _
+    ByVal popSheets As Collection, _
+    ByRef dDt As Object, _
+    ByRef dKt As Object, _
+    ByRef rowsRead As Long, _
+    ByRef rowsWithSum As Long)
+
+
+    Dim i As Long, ws As Worksheet
+    For i = 1 To popSheets.Count
+        Set ws = popSheets(i)
+
+
+        Dim cDt As Long, cKt As Long, cSum As Long, lr As Long
+        Dim sumHdr As String
+
+
+        cDt  = FindHeaderCol(ws, "Счет Дт", 1)
+        cKt  = FindHeaderCol(ws, "Счет Кт", 1)
+        cSum = FindHeaderSyn(ws, Array("Сумма", " сумма", "сумма ", "Сумма абс", "Сумма абс.", "Сумма абсолютная", "Сумма (абс)"), 1, sumHdr)
+
+
+        If cSum = 0 Or (cDt = 0 And cKt = 0) Then
+            LogWrite NowStr() & vbTab & "Пропуск популяции (нет колонки суммы/счетов)" & vbTab & ws.Name
+            GoTo NextSheet
+        End If
+
+
+        lr = LastDataRow2(ws)
+        If lr < 2 Then
+            LogWrite NowStr() & vbTab & "Пропуск популяции (только шапка)" & vbTab & ws.Name
+            GoTo NextSheet
+        End If
+
+
+        Dim aSum As Variant
+        aSum = ws.Range(ws.Cells(2, cSum), ws.Cells(lr, cSum)).Value2
+        rowsRead = rowsRead + UBound(aSum, 1)
+
+
+        Dim used As Long, addedDt As Long, addedKt As Long
+
+
+        If cDt > 0 Then
+            Dim aDt As Variant
+            aDt = ws.Range(ws.Cells(2, cDt), ws.Cells(lr, cDt)).Value2
+            addedDt = AddSumsFromArrays(aDt, aSum, dDt, rowsWithSum)
+        End If
+
+
+        If cKt > 0 Then
+            Dim aKt As Variant
+            aKt = ws.Range(ws.Cells(2, cKt), ws.Cells(lr, cKt)).Value2
+            addedKt = AddSumsFromArrays(aKt, aSum, dKt, rowsWithSum)
+        End If
+
+
+        used = Application.WorksheetFunction.Max(addedDt, addedKt)
+        LogWrite NowStr() & vbTab & "Источник популяции" & vbTab & ws.Name & _
+                "  СуммаКолонка='" & sumHdr & "' (c" & cSum & ")" & _
+                "  Строк=" & (lr - 1) & _
+                "  Учтено(Дт)=" & addedDt & _
+                "  Учтено(Кт)=" & addedKt
+NextSheet:
+    Next i
+End Sub
+
+
+' Возвращает сколько строк реально учтено (с корректной суммой)
+Private Function AddSumsFromArrays(ByVal arrAcc As Variant, ByVal arrSum As Variant, ByRef d As Object, ByRef rowsWithSum As Long) As Long
+    Dim i As Long, acc As String, v As Double, ok As Boolean, hit As Long
+    Dim n As Long: n = UBound(arrAcc, 1)
+    For i = 1 To n
+        acc = ToAccountText(arrAcc(i, 1))
+        If LenB(acc) = 0 Then GoTo NextI
+
+
+        ok = False
+        v = ToDoubleSafe(arrSum(i, 1), ok)
+        If Not ok Then GoTo NextI
+
+
+        rowsWithSum = rowsWithSum + 1
+        hit = hit + 1
+        If d.Exists(acc) Then
+            d(acc) = CDbl(d(acc)) + v
+        Else
+            d.Add acc, v
+        End If
+NextI:
+    Next i
+    AddSumsFromArrays = hit
+End Function
+
+
+'============================== ВЫВОД/СОРТИРОВКА ===============================
+
+
+Private Function DictToSortedArray2ColsDbl(ByVal d As Object) As Variant
+    Dim n As Long: n = d.Count
+    If n = 0 Then Exit Function
+
+
+    Dim keys() As String: ReDim keys(1 To n)
+    Dim i As Long, k As Variant
+    i = 0
+    For Each k In d.Keys
+        i = i + 1
+        keys(i) = CStr(k)
+    Next k
+    QuickSortStrings keys, 1, n
+
+
+    Dim outArr() As Variant: ReDim outArr(1 To n, 1 To 2)
+    For i = 1 To n
+        outArr(i, 1) = keys(i)               ' Счёт
+        outArr(i, 2) = CDbl(d(keys(i)))      ' Сумма
+    Next i
+    DictToSortedArray2ColsDbl = outArr
+End Function
+
+
+Private Sub QuickSortStrings(ByRef A() As String, ByVal L As Long, ByVal R As Long)
+    Dim i As Long, j As Long
+    Dim p As String, t As String
+    i = L: j = R: p = A((L + R) \ 2)
+    Do While i <= j
+        Do While StrComp(A(i), p, vbTextCompare) < 0: i = i + 1: Loop
+        Do While StrComp(A(j), p, vbTextCompare) > 0: j = j - 1: Loop
+        If i <= j Then
+            t = A(i): A(i) = A(j): A(j) = t
+            i = i + 1: j = j - 1
+        End If
+    Loop
+    If L < j Then QuickSortStrings A, L, j
+    If i < R Then QuickSortStrings A, i, R
+End Sub
+
+
+'============================== ПОМОЩНИКИ ПО ЛИСТУ =============================
+
+
+Private Function GetPopulationSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection, sh As Worksheet, nm As String
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If nm = POP_BASE Or Left$(nm, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+    Set GetPopulationSheets = col
+End Function
+
+
+Private Function FindTextInRowExact(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal whatText As String, ByVal minCol As Long) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    For c = minCol To lastCol
+        If CStr(ws.Cells(rowNum, c).Value) = whatText Then
+            FindTextInRowExact = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long, rng As Range, f As Range
+    lastRow = ws.Rows.Count
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstBelowInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstBelowInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal hdrRow As Long) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If CStr(ws.Cells(hdrRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+' Поиск заголовка по набору синонимов. Возвращает найденную колонку и сам текст заголовка.
+Private Function FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant, ByVal hdrRow As Long, ByRef foundHeader As String) As Long
+    Dim lastCol As Long, j As Long, i As Long
+    Dim head As String, key As String
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        head = NormalizeHeaderText(CStr(ws.Cells(hdrRow, j).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                key = NormalizeHeaderText(CStr(syns(i)))
+                If head = key Then
+                    foundHeader = CStr(ws.Cells(hdrRow, j).Value)
+                    FindHeaderSyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = s
+End Function
+
+
+Private Function LastDataRow2(ByVal ws As Worksheet) As Long
+    Dim lastCol As Long, c As Long, lr As Long, l As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        l = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If l > lr Then lr = l
+    Next c
+    If lr < 2 Then lr = 2
+    LastDataRow2 = lr
+End Function
+
+
+Private Sub ClearRangeBorders(ByVal ws As Worksheet, ByVal rng As Range)
+    On Error Resume Next
+    rng.ClearContents
+    rng.Borders.LineStyle = xlNone
+    On Error GoTo 0
+End Sub
+
+
+Private Sub ThickBox(ByVal rng As Range)
+    With rng.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+End Sub
+
+
+Private Function CountSafe(ByVal d As Object) As Long
+    On Error Resume Next
+    CountSafe = d.Count
+End Function
+
+
+Private Function SumDictDbl(ByVal d As Object) As Double
+    On Error Resume Next
+    Dim v As Variant, s As Double
+    For Each v In d.Items
+        s = s + CDbl(v)
+    Next v
+    SumDictDbl = s
+End Function
+
+
+'============================== ТЕКСТ/ЧИСЛО ====================================
+
+
+Private Function ToAccountText(ByVal v As Variant) As String
+    On Error GoTo Fallback
+    If IsError(v) Then Exit Function
+    If VarType(v) = vbString Then
+        ToAccountText = Trim$(CStr(v))
+        Exit Function
+    End If
+    If IsNumeric(v) Then
+        Dim s As String
+        s = CStr(v)
+        s = Replace$(s, Application.International(xlDecimalSeparator), ".")
+        ToAccountText = Trim$(s)
+        Exit Function
+    End If
+    ToAccountText = Trim$(CStr(v))
+    Exit Function
+Fallback:
+    ToAccountText = ""
+End Function
+
+
+Private Function ToDoubleSafe(ByVal v As Variant, ByRef ok As Boolean) As Double
+    On Error GoTo Fallback
+    ok = False
+    If IsError(v) Then Exit Function
+    If IsNumeric(v) Then
+        ok = True
+        ToDoubleSafe = CDbl(v)
+        Exit Function
+    End If
+    Dim s As String, nb As String
+    s = CStr(v)
+    If LenB(s) = 0 Then Exit Function
+    nb = Chr$(160)
+    s = Replace$(s, nb, "")
+    s = Replace$(s, " ", "")
+    s = Replace$(s, ",", Application.International(xlDecimalSeparator))
+    ToDoubleSafe = CDbl(s)
+    ok = True
+    Exit Function
+Fallback:
+    ok = False
+    ToDoubleSafe = 0#
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

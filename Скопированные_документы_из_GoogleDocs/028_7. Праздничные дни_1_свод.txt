@@ -1,0 +1,959 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modSvod_Holidays
+' Версия:    1.0.3  (06.10.2025)
+'
+' Что нового vs 1.0.2:
+'   - Подгонка количества строк перед выводом данных переделана на операции
+'     с ЦЕЛЫМИ СТРОКАМИ листа (EntireRow), вместо вставки/удаления ячеек в 5-колоночной области.
+'     Это исключает смещение содержимого ниже рабочей области.
+'   - Добавлены хелперы HOL_InsertEntireRows / HOL_DeleteEntireRows; расширено логирование.
+'
+' Назначение:
+'   Свод проводок по ПРАЗДНИЧНЫМ дням на лист "7. Праздники" под якорем
+'   "Свод проводок по праздничным дням>>>"
+'   Шапка: Дата | Кол-во повторений | Сумма | Регистр | Отклонение
+'   Источник: популяция ("Популяция для тестирования" и "Популяция для тестирования_Ч*").
+'   Праздничные даты: лист "Производственный календарь 2024", колонка 1 (формат dd.mm.yyyy, как у вас).
+'
+' Форматы чисел: "# ##0;-# ##0;-"  (тысячные разделители, без десятичных, ноль как "-").
+' Логи: лист "Логи". Все процедуры LogWrite — Private.
+'========================================================================================
+
+
+Private Const MacroVersion          As String = "1.0.3"
+Private Const LOG_SHEET             As String = "Логи"
+
+
+' Целевой лист/якоря
+Private Const SHEET_TARGET          As String = "7. Праздники"
+Private Const ANCHOR_COL            As Long = 2
+Private Const ANCHOR_TEXT           As String = "Свод проводок по праздничным дням>>>"
+Private Const HEADER_HEIGHT         As Long = 1
+Private Const TOTAL_TEXT            As String = "Итого"
+
+
+' Источники (популяция)
+Private Const POP_BASE              As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF         As String = "_Ч"
+
+
+' Лист с праздничными датами
+Private Const SHEET_HOL_CAL         As String = "Производственный календарь 2024"
+Private Const HOL_DATES_COL         As Long = 1
+
+
+' Форматы
+Private Const NUM_FMT               As String = "# ##0;-# ##0;-"
+
+
+' Локальные переменные для логирования
+Private currentStep As String
+Private stepT As Double
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Заполнить_Свод_Праздники()
+    Dim t0 As Double
+    t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    appCalc = Application.Calculation
+
+
+    Dim scrUp As Boolean
+    scrUp = Application.ScreenUpdating
+
+
+    Dim evt As Boolean
+    evt = Application.EnableEvents
+
+
+    Dim alr As Boolean
+    alr = Application.DisplayAlerts
+
+
+    On Error GoTo EH
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite HOL_NowStr() & vbTab & "Старт" & vbTab & "Заполнить_Свод_Праздники v" & MacroVersion
+
+
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+
+    ' ---------- Лист назначения и якорь ----------
+    StartStep "Поиск листа назначения и якоря"
+    Dim wsDst As Worksheet
+    Set wsDst = wb.Worksheets(SHEET_TARGET)
+
+
+    Dim anchorRow As Long
+    anchorRow = HOL_FindFirstInColumnExact(wsDst, ANCHOR_COL, ANCHOR_TEXT)
+    If anchorRow = 0 Then
+        Err.Raise 5, , "Не найден якорь '" & ANCHOR_TEXT & "' в кол. " & ANCHOR_COL
+    End If
+
+
+    Dim headerTop As Long
+    headerTop = anchorRow + 1
+
+
+    Dim dataTop As Long
+    dataTop = headerTop + HEADER_HEIGHT
+
+
+    Dim totalRow As Long
+    totalRow = HOL_FindFirstBelowInColumnExact(wsDst, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Or totalRow <= dataTop Then
+        Err.Raise 5, , "Метка 'Итого' не найдена ниже шапки"
+    End If
+
+
+    Dim dataBottom As Long
+    dataBottom = totalRow - 1
+
+
+    LogWrite HOL_NowStr() & vbTab & "? Приёмник" & vbTab & _
+        "AnchorRow=" & anchorRow & "; HeaderTop=" & headerTop & "; DataTop=" & dataTop & "; TotalRow=" & totalRow
+    EndStep
+
+
+    ' ---------- Список праздничных дат ----------
+    StartStep "Чтение праздничных дат"
+    Dim holSet As Object
+    Set holSet = CreateObject("Scripting.Dictionary")
+    holSet.CompareMode = vbTextCompare
+
+
+    Dim wsHol As Worksheet
+    Set wsHol = wb.Worksheets(SHEET_HOL_CAL)
+
+
+    Dim lastHolRow As Long
+    lastHolRow = wsHol.Cells(wsHol.Rows.Count, HOL_DATES_COL).End(xlUp).Row
+    LogWrite HOL_NowStr() & vbTab & "? Календарь lastRow" & vbTab & lastHolRow
+
+
+    Dim holArr As Variant
+    Dim cntHol As Long
+    cntHol = 0
+
+
+    If lastHolRow >= 1 Then
+        holArr = wsHol.Range(wsHol.Cells(1, HOL_DATES_COL), wsHol.Cells(lastHolRow, HOL_DATES_COL)).Value2
+
+
+        Dim r As Long
+        Dim key As String
+        Dim sampleLogged As Long
+        sampleLogged = 0
+
+
+        For r = 1 To UBound(holArr, 1)
+            key = HOL_ToDateKey(holArr(r, 1))
+            If sampleLogged < 5 Then
+                LogWrite HOL_NowStr() & vbTab & "• Пример(" & r & "): V2=" & HOL_ShowVariant(holArr(r, 1)) & "  => key=" & key
+                sampleLogged = sampleLogged + 1
+            End If
+            If LenB(key) > 0 Then
+                If Not holSet.Exists(key) Then
+                    holSet.Add key, True
+                    cntHol = cntHol + 1
+                End If
+            End If
+        Next r
+
+
+        LogWrite HOL_NowStr() & vbTab & "? Праздничных дат (уник.)" & vbTab & cntHol
+    Else
+        LogWrite HOL_NowStr() & vbTab & "Внимание" & vbTab & "На листе календаря нет дат"
+    End If
+    EndStep
+
+
+    ' ---------- Листы популяции ----------
+    StartStep "Поиск листов популяции"
+    Dim popSheets As Collection
+    Set popSheets = HOL_GetPopulationSheets(wb)
+    If popSheets Is Nothing Or popSheets.Count = 0 Then
+        LogWrite HOL_NowStr() & vbTab & "Внимание" & vbTab & "Листы популяции не найдены — свод будет очищен"
+    Else
+        LogWrite HOL_NowStr() & vbTab & "Найдено листов популяции" & vbTab & popSheets.Count
+    End If
+    EndStep
+
+
+    ' ---------- Агрегация по ПРАЗДНИЧНЫМ датам ----------
+    StartStep "Агрегация по праздничным датам (Count, Sum, Register)"
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = vbTextCompare
+
+
+    Dim rowsRead As Long
+    Dim rowsWithDate As Long
+    Dim rowsHoliday As Long
+    Dim rowsWithSumParsed As Long
+    Dim rowsWithRegParsed As Long
+
+
+    If Not popSheets Is Nothing And popSheets.Count > 0 And holSet.Count > 0 Then
+        HOL_AggregateByHoliday_FromPopulation popSheets, holSet, d, _
+            rowsRead, rowsWithDate, rowsHoliday, rowsWithSumParsed, rowsWithRegParsed
+    End If
+
+
+    LogWrite HOL_NowStr() & vbTab & "? Агрегация" & vbTab & _
+        "Прочитано=" & rowsRead & _
+        "; С датой=" & rowsWithDate & _
+        "; Праздн. дат=" & rowsHoliday & _
+        "; Сумма ok=" & rowsWithSumParsed & _
+        "; Регистр ok=" & rowsWithRegParsed & _
+        "; Уникальных дат=" & d.Count
+    EndStep
+
+
+    ' ---------- Очистка границ и ПОДГОНКА КОЛИЧЕСТВА СТРОК (цельные строки) ----------
+    StartStep "Очистка границ и подгонка количества строк (цельные строки)"
+    HOL_ClearBorders wsDst, wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(IIf(dataBottom >= dataTop, dataBottom, dataTop), ANCHOR_COL + 4))
+
+
+    Dim need As Long
+    need = d.Count
+    If need < 0 Then
+        need = 0
+    End If
+
+
+    Dim nRows As Long
+    nRows = dataBottom - dataTop + 1
+
+
+    LogWrite HOL_NowStr() & vbTab & "? Подгонка исходная" & vbTab & "need=" & need & "; nRows=" & nRows & "; TotalRow=" & totalRow
+
+
+    If nRows < need Then
+        Dim insN As Long
+        insN = need - nRows
+        ' Вставляем ЦЕЛЫЕ СТРОКИ перед строкой ИТОГО
+        HOL_InsertEntireRows wsDst, totalRow, insN
+        totalRow = totalRow + insN
+        dataBottom = dataTop + need - 1
+        LogWrite HOL_NowStr() & vbTab & "Вставлено строк (EntireRow)" & vbTab & insN & "; New TotalRow=" & totalRow
+    ElseIf nRows > need Then
+        Dim delN As Long
+        delN = nRows - need
+        If delN > 0 Then
+            ' Удаляем ЦЕЛЫЕ СТРОКИ, начиная сразу после нужного блока данных
+            HOL_DeleteEntireRows wsDst, dataTop + need, delN
+            totalRow = totalRow - delN
+            dataBottom = dataTop + need - 1
+            LogWrite HOL_NowStr() & vbTab & "Удалено строк (EntireRow)" & vbTab & delN & "; New TotalRow=" & totalRow
+        End If
+    Else
+        LogWrite HOL_NowStr() & vbTab & "Подгонка строк" & vbTab & "Не требуется"
+    End If
+    EndStep
+
+
+    ' ---------- Вывод данных ----------
+    StartStep "Вывод данных"
+    If need > 0 Then
+        Dim outArr As Variant
+        outArr = HOL_DictToSortedArray_Holiday(d)
+
+
+        ' Колонки:
+        ' 1: Дата (текст dd.mm.yyyy)
+        ' 2: Кол-во повторений (число)
+        ' 3: Сумма (число)
+        ' 4: Регистр (число)
+        ' 5: Отклонение (формула = Сумма - Регистр)
+        Dim r0 As Long
+        Dim r1 As Long
+        r0 = dataTop
+        r1 = dataBottom
+
+
+        ' Форматы: Дата как текст, остальные — NUM_FMT
+        wsDst.Range(wsDst.Cells(r0, ANCHOR_COL), wsDst.Cells(r1, ANCHOR_COL)).NumberFormat = "@"
+        wsDst.Range(wsDst.Cells(r0, ANCHOR_COL + 1), wsDst.Cells(totalRow, ANCHOR_COL + 4)).NumberFormatLocal = NUM_FMT
+
+
+        ' Значения без отклонения
+        wsDst.Range(wsDst.Cells(r0, ANCHOR_COL), wsDst.Cells(r1, ANCHOR_COL + 3)).Value = outArr
+
+
+        ' Формулы отклонения (построчно): =Сумма - Регистр
+        Dim rr As Long
+        Dim sumCol As Long
+        Dim regCol As Long
+        Dim devCol As Long
+
+
+        sumCol = ANCHOR_COL + 2
+        regCol = ANCHOR_COL + 3
+        devCol = ANCHOR_COL + 4
+
+
+        For rr = r0 To r1
+            wsDst.Cells(rr, devCol).FormulaLocal = "=" & wsDst.Cells(rr, sumCol).Address(False, False) & _
+                                                   "-" & wsDst.Cells(rr, regCol).Address(False, False)
+        Next rr
+
+
+        ' Рамка по всему блоку данных (все 5 колонок)
+        HOL_ThickBox wsDst.Range(wsDst.Cells(r0, ANCHOR_COL), wsDst.Cells(r1, ANCHOR_COL + 4))
+    Else
+        ' Если нет данных — очистим область данных (без шапки/итого) и снимем рамки
+        If dataBottom >= dataTop Then
+            wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + 4)).ClearContents
+            HOL_ClearBorders wsDst, wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + 4))
+        End If
+    End If
+    EndStep
+
+
+FinishOK:
+    LogWrite HOL_NowStr() & vbTab & "Готово" & vbTab & _
+        "Уникальных праздничных дат=" & HOL_CountSafe(d) & _
+        "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+TIDY:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite HOL_NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume TIDY
+End Sub
+
+
+'============================== АГРЕГАЦИЯ (из популяции) =======================
+
+
+Private Sub HOL_AggregateByHoliday_FromPopulation( _
+    ByVal sheets As Collection, _
+    ByVal holSet As Object, _
+    ByRef d As Object, _
+    ByRef rowsRead As Long, _
+    ByRef rowsWithDate As Long, _
+    ByRef rowsHoliday As Long, _
+    ByRef rowsWithSumParsed As Long, _
+    ByRef rowsWithRegParsed As Long)
+
+
+    Dim i As Long
+    For i = 1 To sheets.Count
+        Dim ws As Worksheet
+        Set ws = sheets(i)
+
+
+        Dim colDate As Long
+        Dim colSum As Long
+        Dim colReg As Long
+
+
+        Dim lr As Long
+
+
+        Dim hdrDate As String
+        Dim hdrSum As String
+        Dim hdrReg As String
+
+
+        ' Ищем заголовки
+        colDate = HOL_FindHeaderSyn(ws, Array("Дата", " дата", "дата ", "Дата операции", "Дата проводки"), 1, hdrDate)
+        colSum = HOL_FindHeaderSyn(ws, Array("Сумма", " сумма", "сумма ", "Сумма абс", "Сумма абс.", "Сумма абсолютная", "Сумма (абс)"), 1, hdrSum)
+        colReg = HOL_FindHeaderSyn(ws, Array("Регистр", " регистр", "регистр ", "Сумма регистр", "Сумма (регистр)"), 1, hdrReg)
+
+
+        If colDate = 0 Or colSum = 0 Then
+            LogWrite HOL_NowStr() & vbTab & "Пропуск листа популяции (нет Дата/Сумма)" & vbTab & ws.Name & _
+                    "  Дата=" & colDate & "  Сумма=" & colSum & "  Регистр=" & colReg
+            GoTo NextSheet
+        End If
+
+
+        lr = HOL_LastDataRowOnCols(ws, Array(colDate, colSum, IIf(colReg > 0, colReg, colSum)))
+        If lr < 2 Then
+            GoTo NextSheet
+        End If
+
+
+        ' Считываем компактный блок (от minC до maxC)
+        Dim minC As Long
+        Dim maxC As Long
+        minC = colDate
+        maxC = colSum
+        If colReg > 0 Then
+            If colReg < minC Then minC = colReg
+            If colReg > maxC Then maxC = colReg
+        End If
+
+
+        Dim block As Variant
+        block = ws.Range(ws.Cells(1, minC), ws.Cells(lr, maxC)).Value2
+
+
+        Dim idxDate As Long
+        Dim idxSum As Long
+        Dim idxReg As Long
+
+
+        idxDate = colDate - minC + 1
+        idxSum = colSum - minC + 1
+        If colReg > 0 Then
+            idxReg = colReg - minC + 1
+        Else
+            idxReg = 0
+        End If
+
+
+        Dim r As Long
+        Dim k As String
+        Dim vSum As Double
+        Dim vReg As Double
+        Dim ok As Boolean
+
+
+        Dim rec As Variant ' массив(3): {count, sum, reg}
+
+
+        rowsRead = rowsRead + (lr - 1)
+        For r = 2 To lr
+            k = HOL_ToDateKey(block(r, idxDate))
+            If LenB(k) = 0 Then
+                GoTo NextR
+            End If
+
+
+            rowsWithDate = rowsWithDate + 1
+
+
+            ' Только праздничные
+            If Not holSet.Exists(k) Then
+                GoTo NextR
+            End If
+            rowsHoliday = rowsHoliday + 1
+
+
+            ' Сумма
+            ok = False
+            vSum = HOL_ToDoubleSafe(block(r, idxSum), ok)
+            If ok Then
+                rowsWithSumParsed = rowsWithSumParsed + 1
+            Else
+                vSum = 0#
+            End If
+
+
+            ' Регистр (если колонки нет — 0)
+            vReg = 0#
+            If idxReg > 0 Then
+                ok = False
+                vReg = HOL_ToDoubleSafe(block(r, idxReg), ok)
+                If ok Then
+                    rowsWithRegParsed = rowsWithRegParsed + 1
+                Else
+                    vReg = 0#
+                End If
+            End If
+
+
+            If d.Exists(k) Then
+                rec = d(k)
+                rec(0) = CLng(rec(0)) + 1&
+                rec(1) = CDbl(rec(1)) + vSum
+                rec(2) = CDbl(rec(2)) + vReg
+                d(k) = rec
+            Else
+                rec = Array(1&, CDbl(vSum), CDbl(vReg)) ' count, sum, reg
+                d.Add k, rec
+            End If
+NextR:
+        Next r
+
+
+        LogWrite HOL_NowStr() & vbTab & "Источник популяции" & vbTab & ws.Name & _
+                "  Строк=" & (lr - 1) & _
+                "  Дата='" & hdrDate & "'(c" & colDate & ")" & _
+                "  Сумма='" & hdrSum & "'(c" & colSum & ")" & _
+                "  Регистр='" & IIf(colReg > 0, hdrReg, "нет") & "'(c" & colReg & ")"
+NextSheet:
+    Next i
+End Sub
+
+
+'============================== ВЫВОД / СОРТИРОВКА =============================
+
+
+' d: key="dd.mm.yyyy" -> Array(count, sum, reg)
+Private Function HOL_DictToSortedArray_Holiday(ByVal d As Object) As Variant
+    Dim n As Long
+    n = d.Count
+    If n = 0 Then Exit Function
+
+
+    Dim keys() As String
+    ReDim keys(1 To n)
+
+
+    Dim sortN() As Long
+    ReDim sortN(1 To n)
+
+
+    Dim i As Long
+    Dim k As Variant
+    i = 0
+    For Each k In d.Keys
+        i = i + 1
+        keys(i) = CStr(k)
+        sortN(i) = HOL_DateKeyToSortNum(CStr(k))
+    Next k
+
+
+    HOL_QuickSortByNum keys, sortN, 1, n
+
+
+    Dim outArr() As Variant
+    ReDim outArr(1 To n, 1 To 4) ' Дата, Кол-во, Сумма, Регистр
+
+
+    Dim rec As Variant
+    For i = 1 To n
+        rec = d(keys(i))
+        outArr(i, 1) = keys(i)            ' Дата (текст)
+        outArr(i, 2) = CLng(rec(0))       ' Кол-во
+        outArr(i, 3) = CDbl(rec(1))       ' Сумма
+        outArr(i, 4) = CDbl(rec(2))       ' Регистр
+    Next i
+
+
+    HOL_DictToSortedArray_Holiday = outArr
+End Function
+
+
+Private Function HOL_DateKeyToSortNum(ByVal k As String) As Long
+    Dim dd As Long
+    Dim mm As Long
+    Dim yy As Long
+
+
+    On Error Resume Next
+    dd = CLng(Val(Left$(k, 2)))
+    mm = CLng(Val(Mid$(k, 4, 2)))
+    yy = CLng(Val(Right$(k, 4)))
+    On Error GoTo 0
+
+
+    HOL_DateKeyToSortNum = yy * 10000& + mm * 100& + dd
+End Function
+
+
+Private Sub HOL_QuickSortByNum(ByRef a() As String, ByRef k() As Long, ByVal L As Long, ByVal r As Long)
+    Dim i As Long
+    Dim j As Long
+    Dim p As Long
+    Dim ts As String
+    Dim tk As Long
+
+
+    i = L
+    j = r
+    p = k((L + r) \ 2)
+
+
+    Do While i <= j
+        Do While k(i) < p
+            i = i + 1
+        Loop
+        Do While k(j) > p
+            j = j - 1
+        Loop
+        If i <= j Then
+            tk = k(i)
+            k(i) = k(j)
+            k(j) = tk
+
+
+            ts = a(i)
+            a(i) = a(j)
+            a(j) = ts
+
+
+            i = i + 1
+            j = j - 1
+        End If
+    Loop
+
+
+    If L < j Then HOL_QuickSortByNum a, k, L, j
+    If i < r Then HOL_QuickSortByNum a, k, i, r
+End Sub
+
+
+'============================== ПОМОЩНИКИ ПО ЛИСТАМ ============================
+
+
+Private Function HOL_GetPopulationSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection
+    Dim sh As Worksheet
+    Dim nm As String
+
+
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If nm = POP_BASE Or Left$(nm, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+
+
+    Set HOL_GetPopulationSheets = col
+End Function
+
+
+Private Function HOL_FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range
+    Dim f As Range
+
+
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+
+
+    If f Is Nothing Then
+        HOL_FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            HOL_FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            HOL_FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function HOL_FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long
+    Dim rng As Range
+    Dim f As Range
+
+
+    lastRow = ws.Rows.Count
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+
+
+    If f Is Nothing Then
+        HOL_FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            HOL_FindFirstBelowInColumnExact = f.MergeArea.Row
+        Else
+            HOL_FindFirstBelowInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+' Поиск заголовка по синонимам
+Private Function HOL_FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant, ByVal hdrRow As Long, ByRef foundHeader As String) As Long
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+
+
+    Dim j As Long
+    Dim i As Long
+    Dim head As String
+    Dim key As String
+
+
+    foundHeader = vbNullString
+
+
+    For j = 1 To lastCol
+        head = HOL_NormalizeHeaderText(CStr(ws.Cells(hdrRow, j).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                key = HOL_NormalizeHeaderText(CStr(syns(i)))
+                If head = key Then
+                    foundHeader = CStr(ws.Cells(hdrRow, j).Value)
+                    HOL_FindHeaderSyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+End Function
+
+
+Private Function HOL_LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long
+    Dim j As Long
+    Dim lrj As Long
+    Dim c As Long
+
+
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then
+                lr = lrj
+            End If
+        End If
+    Next j
+
+
+    If lr < 2 Then
+        lr = 2
+    End If
+    HOL_LastDataRowOnCols = lr
+End Function
+
+
+Private Function HOL_NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String
+    nb = Chr$(160)
+
+
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+
+
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+
+
+    HOL_NormalizeHeaderText = s
+End Function
+
+
+Private Sub HOL_ClearBorders(ByVal ws As Worksheet, ByVal rng As Range)
+    On Error Resume Next
+    rng.Borders.LineStyle = xlNone
+    On Error GoTo 0
+End Sub
+
+
+Private Sub HOL_ThickBox(ByVal rng As Range)
+    With rng.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+End Sub
+
+
+Private Function HOL_CountSafe(ByVal d As Object) As Long
+    On Error Resume Next
+    HOL_CountSafe = d.Count
+End Function
+
+
+'============================== ВСТАВКА/УДАЛЕНИЕ ЦЕЛЫХ СТРОК ===================
+
+
+Private Sub HOL_InsertEntireRows(ByVal ws As Worksheet, ByVal atRow As Long, ByVal n As Long)
+    If n <= 0 Then Exit Sub
+    If atRow < 1 Then Exit Sub
+    ws.Rows(atRow).Resize(n).Insert xlShiftDown
+End Sub
+
+
+Private Sub HOL_DeleteEntireRows(ByVal ws As Worksheet, ByVal atRow As Long, ByVal n As Long)
+    If n <= 0 Then Exit Sub
+    If atRow < 1 Then Exit Sub
+    ws.Rows(atRow).Resize(n).Delete xlShiftUp
+End Sub
+
+
+'============================== ТЕКСТ/ЧИСЛО/ДАТА ===============================
+
+
+' Возвращает ключ даты "dd.mm.yyyy" или "" если распознать не удалось
+Private Function HOL_ToDateKey(ByVal v As Variant) As String
+    On Error GoTo Fallback
+
+
+    If IsError(v) Then
+        Exit Function
+    End If
+
+
+    ' Числовая дата Excel
+    If IsNumeric(v) And Val(v) > 0 Then
+        HOL_ToDateKey = Format$(CDate(v), "dd.mm.yyyy")
+        Exit Function
+    End If
+
+
+    ' Текстовый формат dd.mm.yyyy
+    Dim s As String
+    s = CStr(v)
+    s = Trim$(s)
+
+
+    If LenB(s) = 0 Then
+        Exit Function
+    End If
+
+
+    ' Быстрый тест формата dd.mm.yyyy
+    If Len(s) = 10 And Mid$(s, 3, 1) = "." And Mid$(s, 6, 1) = "." Then
+        If IsDate(s) Then
+            HOL_ToDateKey = Format$(CDate(s), "dd.mm.yyyy")
+            Exit Function
+        End If
+    End If
+
+
+    ' Последняя попытка — прямое CDate (с учётом локали)
+    If IsDate(s) Then
+        HOL_ToDateKey = Format$(CDate(s), "dd.mm.yyyy")
+        Exit Function
+    End If
+
+
+    Exit Function
+Fallback:
+    HOL_ToDateKey = ""
+End Function
+
+
+' Надёжное чтение числа (учёт неразрывных пробелов/десят. разделителей)
+Private Function HOL_ToDoubleSafe(ByVal v As Variant, ByRef ok As Boolean) As Double
+    On Error GoTo Fallback
+
+
+    ok = False
+    If IsError(v) Then
+        Exit Function
+    End If
+
+
+    If IsNumeric(v) Then
+        ok = True
+        HOL_ToDoubleSafe = CDbl(v)
+        Exit Function
+    End If
+
+
+    Dim s As String
+    Dim nb As String
+
+
+    s = CStr(v)
+    If LenB(s) = 0 Then
+        Exit Function
+    End If
+
+
+    nb = Chr$(160)
+    s = Replace$(s, nb, "")
+    s = Replace$(s, " ", "")
+    s = Replace$(s, ",", Application.International(xlDecimalSeparator))
+
+
+    HOL_ToDoubleSafe = CDbl(s)
+    ok = True
+    Exit Function
+Fallback:
+    ok = False
+    HOL_ToDoubleSafe = 0#
+End Function
+
+
+Private Function HOL_ShowVariant(ByVal v As Variant) As String
+    On Error Resume Next
+    If IsError(v) Then
+        HOL_ShowVariant = "#Error"
+    ElseIf IsEmpty(v) Then
+        HOL_ShowVariant = "#Empty"
+    Else
+        HOL_ShowVariant = CStr(v)
+    End If
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Dim r As Long
+
+
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+
+
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite HOL_NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite HOL_NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function HOL_NowStr() As String
+    HOL_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

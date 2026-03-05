@@ -1,0 +1,170 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modMaster_RO_Vvod_Simple
+' Версия:    1.0.0  (22.09.2025)
+'
+' Что делает:
+'   Последовательно вызывает:
+'     1) Заполнить_РО_по_вводу_доходов_популяция
+'     2) Копировать_РО_по_вводу_доходов_в_3л
+'     3) Рандом_выборка_РО_по_вводу_доходов
+'     4) Вставить_на_лист_РО_по_вводу
+'     5) Отметить_РО_по_вводу_К_Запросу
+'
+' Особенности:
+'   - Подробное логирование на лист "Логи" (Private LogWrite).
+'   - Время по каждому шагу и по всей сессии.
+'   - Бережное управление окружением Excel.
+'   - Простая обработка ошибок: STOP_ON_ERROR=True — стоп на первом сбое.
+'========================================================================================
+
+
+Private Const MACRO_VERSION As String = "1.0.0"
+Private Const LOG_SHEET     As String = "Логи"
+Private Const STOP_ON_ERROR As Boolean = True
+
+
+' Окружение
+Private prevCalc As XlCalculation
+Private prevScr As Boolean
+Private prevEvt As Boolean
+Private prevAlr As Boolean
+
+
+' Текущий шаг (для лога ошибок)
+Private currentStep As String
+
+
+'============================== ТОЧКА ВХОДА ====================================
+Public Sub Мастер_РО_рандомные()
+    Dim t0 As Double: t0 = Timer
+    Dim t As Double
+
+
+    On Error GoTo EH
+
+
+    EnvOff
+    LogWrite "Старт Мастер_RO_Vvod v" & MACRO_VERSION
+
+
+    ' --- 1 ---
+    currentStep = "Шаг 1: Заполнить_РО_рандомные_популяция"
+    t = StepStart(currentStep)
+    Call Заполнить_РО_рандомные_популяция
+    StepEnd currentStep, t
+    DoEvents
+
+
+    ' --- 2 ---
+    currentStep = "Шаг 2: Копировать_РО_рандомные_в_3л"
+    t = StepStart(currentStep)
+    Call Копировать_РО_рандомные_в_3л
+    StepEnd currentStep, t
+    DoEvents
+
+
+    ' --- 3 ---
+    currentStep = "Шаг 3: Рандом_выборка_РО_рандомные"
+    t = StepStart(currentStep)
+    Call Рандом_выборка_РО_рандомные
+    StepEnd currentStep, t
+    DoEvents
+
+
+    ' --- 4 ---
+    currentStep = "Шаг 4: Вставить_на_лист_РО_по_вводу"
+    t = StepStart(currentStep)
+    Call Вставить_на_лист_РО_рандомные
+    StepEnd currentStep, t
+    DoEvents
+
+
+   ' --- 5 ---
+    currentStep = "Шаг 5: Отметить_РО_по_вводу_К_Запросу"
+    t = StepStart(currentStep)
+    Call Отметить_РО_рандомные_К_Запросу
+    StepEnd currentStep, t
+
+
+    LogWrite "Готово. Общее время: " & Format$(Timer - t0, "0.00") & " c"
+
+
+Tidy:
+    EnvOn
+    currentStep = vbNullString
+    Exit Sub
+
+
+EH:
+    LogWrite "ОШИБКА на '" & currentStep & "': " & Err.Number & " — " & Err.Description
+    If STOP_ON_ERROR Then
+        Resume Tidy
+    Else
+        ' Продолжить выполнение следующего шага (если нужно — можно усложнить маршрутизацию)
+        Resume Next
+    End If
+End Sub
+
+
+'============================== ВСПОМОГАТЕЛЬНЫЕ ===============================
+Private Sub EnvOff()
+    On Error Resume Next
+    prevCalc = Application.Calculation
+    prevScr = Application.ScreenUpdating
+    prevEvt = Application.EnableEvents
+    prevAlr = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite "Окружение: ScreenUpdating=False; Events=False; Alerts=False; Calc=Manual"
+End Sub
+
+
+Private Sub EnvOn()
+    On Error Resume Next
+    Application.ScreenUpdating = prevScr
+    Application.EnableEvents = prevEvt
+    Application.DisplayAlerts = prevAlr
+    Application.Calculation = prevCalc
+    LogWrite "Окружение восстановлено."
+End Sub
+
+
+Private Function StepStart(ByVal stepName As String) As Double
+    LogWrite ">> " & stepName
+    StepStart = Timer
+End Function
+
+
+Private Sub StepEnd(ByVal stepName As String, ByVal tStart As Double)
+    LogWrite "<< " & stepName & "  (" & Format$(Timer - tStart, "0.00") & " c)"
+End Sub
+
+
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.rows.count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Master_RO_Vvod v" & MACRO_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Function OS_NowStr() As String
+    OS_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

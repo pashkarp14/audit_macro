@@ -1,0 +1,260 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Лист:      7. Праздники
+' Модуль:    Sheet_7_Prazdniki_Trigger
+' Версия:    1.0.2  (18.09.2025)
+'
+' Изменения в 1.0.2:
+'   - Триггер B: корректный сдвиг цели -> (row+2, col+1) вместо (row+2, col+2).
+'   - Ранний фильтр по столбцам: теперь 6 (для A) и 3 (для B).
+'
+' Что делает:
+'   Отслеживает изменения строго в заданных ячейках относительно двух якорей:
+'   [A] Якорь в кол.5:  "Настройки выборки >>>"
+'       - Изменились (row+1, col+1) ИЛИ (row+2, col+1) ИЛИ (row+3, col+1)  -> Call Holidays_Call1
+'       - Изменилась  (row+4, col+1)                                       -> Call Holidays_Call2
+'   [B] Якорь в кол.2:  "Выборка для тестирования (в рублях) >>>"
+'       - Изменилась  (row+2, col+1)                                       -> Call Holidays_Call3
+'
+' Оптимизация:
+'   - Ранний выход по несоответствующим столбцам (6 и 3).
+'   - Поиск якорей .Find только в нужных столбцах.
+'   - Защита от рекурсии через флаг isInsideHandler.
+'
+' Логирование:
+'   - Подробные логи на лист "Логи". Локальная Private LogWrite_Private — без конфликтов имён.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.0.2"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+Private isInsideHandler As Boolean
+
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    On Error GoTo Err_Handler
+
+
+    If isInsideHandler Then Exit Sub
+    If Target Is Nothing Then Exit Sub
+    If Target.CountLarge > 100000 Then Exit Sub   ' защита от массовых заливок
+
+
+    ' РАННИЙ ФИЛЬТР ПО СТОЛБЦАМ:
+    ' Триггер A смотрит в столбец (anchor col 5) + 1 = 6
+    ' Триггер B смотрит в столбец (anchor col 2) + 1 = 3  [исправлено]
+    Dim hitColA As Boolean
+    Dim hitColB As Boolean
+
+
+    hitColA = Not (Intersect(Target, Me.Columns(6)) Is Nothing)
+    hitColB = Not (Intersect(Target, Me.Columns(3)) Is Nothing)
+
+
+    If Not hitColA And Not hitColB Then Exit Sub
+
+
+    isInsideHandler = True
+    Call LogWrite_Private("7. Праздники v" & MODULE_VERSION & " — Change: " & Target.Address(0, 0))
+
+
+    Application.EnableEvents = False
+
+
+    ' ----------------------------
+    ' [A] Якорь в 5-м столбце
+    ' ----------------------------
+    If hitColA Then
+        Dim anchorA As Range
+        Set anchorA = FindAnchorInColumn(ws:=Me, anchorText:="Настройки выборки >>>", searchColumn:=5)
+
+
+        If Not anchorA Is Nothing Then
+            Dim cA1 As Range
+            Dim cA2 As Range
+            Dim cA3 As Range
+            Dim cA4 As Range
+
+
+            Set cA1 = Me.Cells(anchorA.Row + 1, anchorA.Column + 1)
+            Set cA2 = Me.Cells(anchorA.Row + 2, anchorA.Column + 1)
+            Set cA3 = Me.Cells(anchorA.Row + 3, anchorA.Column + 1)
+            Set cA4 = Me.Cells(anchorA.Row + 4, anchorA.Column + 1)
+
+
+            Dim grpA As Range
+            Set grpA = UnionSafe(cA1, cA2, cA3, cA4)
+
+
+            If Not grpA Is Nothing Then
+                Dim hitA As Range
+                Set hitA = Intersect(Target, grpA)
+
+
+                If Not hitA Is Nothing Then
+                    ' Колл первый — любые из (A1, A2, A3)
+                    If Not Intersect(Target, UnionSafe(cA1, cA2, cA3)) Is Nothing Then
+                        Call LogWrite_Private("Триггер A(1): изменены " & Intersect(Target, UnionSafe(cA1, cA2, cA3)).Address(0, 0))
+                        Call Holidays_Call1
+                    End If
+
+
+                    ' Колл второй — ровно (A4)
+                    If Not Intersect(Target, cA4) Is Nothing Then
+                        Call LogWrite_Private("Триггер A(2): изменена " & cA4.Address(0, 0))
+                        Call Holidays_Call2
+                    End If
+                End If
+            End If
+        Else
+            Call LogWrite_Private("Якорь A не найден в кол.5: 'Настройки выборки >>>'")
+        End If
+    End If
+
+
+    ' ----------------------------
+    ' [B] Якорь во 2-м столбце
+    ' ----------------------------
+    If hitColB Then
+        Dim anchorB As Range
+        Set anchorB = FindAnchorInColumn(ws:=Me, anchorText:="Выборка для тестирования (в рублях) >>>", searchColumn:=2)
+
+
+        If Not anchorB Is Nothing Then
+            Dim cB As Range
+            Set cB = Me.Cells(anchorB.Row + 2, anchorB.Column + 1)  ' (row+2, col+1) — исправлено
+
+
+            If Not Intersect(Target, cB) Is Nothing Then
+                Call LogWrite_Private("Триггер B(3): изменена " & cB.Address(0, 0))
+                Call Holidays_Call3
+            End If
+        Else
+            Call LogWrite_Private("Якорь B не найден в кол.2: 'Выборка для тестирования (в рублях) >>>'")
+        End If
+    End If
+
+
+Exit_Handler:
+    Application.EnableEvents = True
+    isInsideHandler = False
+    Exit Sub
+
+
+Err_Handler:
+    Call LogWrite_Private("ERR Worksheet_Change: " & Err.Number & " — " & Err.Description)
+    Resume Exit_Handler
+End Sub
+
+
+'=========================
+' Helpers — ТОЛЬКО ДЛЯ ЭТОГО ЛИСТА
+'=========================
+Private Function FindAnchorInColumn(ByVal ws As Worksheet, ByVal anchorText As String, ByVal searchColumn As Long) As Range
+    On Error GoTo Err_Handler
+
+
+    Dim rngCol As Range
+    Set rngCol = ws.Columns(searchColumn)
+
+
+    Dim f As Range
+    Set f = rngCol.Find(What:=anchorText, _
+                        After:=rngCol.Cells(rngCol.Rows.Count, 1), _
+                        LookIn:=xlValues, _
+                        LookAt:=xlWhole, _
+                        SearchOrder:=xlByRows, _
+                        SearchDirection:=xlNext, _
+                        MatchCase:=False)
+
+
+    If Not f Is Nothing Then
+        Set FindAnchorInColumn = f
+        Call LogWrite_Private("Найден якорь '" & anchorText & "' в " & f.Address(0, 0))
+    Else
+        Set FindAnchorInColumn = Nothing
+    End If
+    Exit Function
+
+
+Err_Handler:
+    Call LogWrite_Private("ERR FindAnchorInColumn '" & anchorText & "': " & Err.Number & " — " & Err.Description)
+    Set FindAnchorInColumn = Nothing
+End Function
+
+
+Private Function UnionSafe(ByVal r1 As Range, ByVal r2 As Range, Optional ByVal r3 As Range = Nothing, Optional ByVal r4 As Range = Nothing) As Range
+    On Error GoTo Err_Handler
+
+
+    Dim tmp As Range
+    Set tmp = r1
+
+
+    If Not r2 Is Nothing Then
+        Set tmp = Union(tmp, r2)
+    End If
+    If Not r3 Is Nothing Then
+        Set tmp = Union(tmp, r3)
+    End If
+    If Not r4 Is Nothing Then
+        Set tmp = Union(tmp, r4)
+    End If
+
+
+    Set UnionSafe = tmp
+    Exit Function
+
+
+Err_Handler:
+    Call LogWrite_Private("ERR UnionSafe: " & Err.Number & " — " & Err.Description)
+    Set UnionSafe = Nothing
+End Function
+
+
+'-------------------------------
+' ЛОКАЛЬНОЕ ПРИВАТНОЕ ЛОГИРОВАНИЕ
+'-------------------------------
+Private Sub LogWrite_Private(ByVal msg As String)
+    On Error GoTo SilentFail
+
+
+    Dim prevEvents As Boolean
+    prevEvents = Application.EnableEvents
+    Application.EnableEvents = False
+
+
+    Dim wsLog As Worksheet
+    On Error Resume Next
+    Set wsLog = ThisWorkbook.Worksheets(LOG_SHEET)
+    On Error GoTo 0
+
+
+    If wsLog Is Nothing Then
+        Set wsLog = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        wsLog.Name = LOG_SHEET
+        wsLog.Range("A1").Value = "Дата/Время"
+        wsLog.Range("B1").Value = "Сообщение"
+    End If
+
+
+    Dim nextRow As Long
+    nextRow = wsLog.Cells(wsLog.Rows.Count, 1).End(xlUp).Row + 1
+
+
+    wsLog.Cells(nextRow, 1).Value = Now
+    wsLog.Cells(nextRow, 2).Value = msg
+
+
+    Application.EnableEvents = prevEvents
+    Exit Sub
+
+
+SilentFail:
+    On Error Resume Next
+    Application.EnableEvents = True
+End Sub

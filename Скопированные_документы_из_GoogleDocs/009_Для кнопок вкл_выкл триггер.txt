@@ -1,0 +1,219 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Модуль:    modExclTrigger_Toggle
+' Версия:    1.0.1  (06.10.2025)
+'
+' Что нового vs 1.0.0:
+'   - FIX: вызовы через Call оформлены со скобками: Call Proc(args)
+'   - Исправлены строки логирования (русская кодировка).
+'   - Доп. лог: текущее состояние флага после переключения.
+'
+' Назначение:
+'   - ВКЛ/ВЫКЛ триггера листа "2. Проводки к исключению  — триггеры"
+'   - Создание двух кнопок (Form Controls) для ручного управления
+'
+' Логи: лист "Логи" (подробно).
+'===============================================================================
+
+
+Private Const LOG_SHEET         As String = "Логи"
+Private Const TARGET_SHEET_NAME As String = "2. Проводки к исключению  — триггеры"
+Private Const TRG_NAME_ENABLED  As String = "TRG_EXCL_ENABLED"
+
+
+'----------------------------- ПУБЛИЧНЫЕ КНОПКИ -------------------------------
+
+
+Public Sub ExclTrigger_Enable()
+    Dim was As Boolean
+    was = TRG_GetEnabledSafe()
+
+
+    Call TRG_SetEnabled(True)
+
+
+    If was <> True Then
+        TRG_LogWrite "Триггер включен (был: " & CStr(was) & ")"
+    Else
+        TRG_LogWrite "Триггер включен (без изменений)"
+    End If
+
+
+    TRG_LogWrite "Текущее состояние: " & CStr(TRG_GetEnabledSafe())
+    Call TRG_UpdateButtonsVisual
+End Sub
+
+
+Public Sub ExclTrigger_Disable()
+    Dim was As Boolean
+    was = TRG_GetEnabledSafe()
+
+
+    Call TRG_SetEnabled(False)
+
+
+    If was <> False Then
+        TRG_LogWrite "Триггер выключен (был: " & CStr(was) & ")"
+    Else
+        TRG_LogWrite "Триггер выключен (без изменений)"
+    End If
+
+
+    TRG_LogWrite "Текущее состояние: " & CStr(TRG_GetEnabledSafe())
+    Call TRG_UpdateButtonsVisual
+End Sub
+
+
+' Быстрая установка двух кнопок на целевом листе
+Public Sub ExclTrigger_AddButtons()
+    On Error GoTo EH
+
+
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(TARGET_SHEET_NAME)
+
+
+    ' Удалим старые, если были
+    Call TRG_SafeDeleteShape(ws, "btnExclTrigOn")
+    Call TRG_SafeDeleteShape(ws, "btnExclTrigOff")
+
+
+    ' Добавим "ВКЛ"
+    Dim shpOn As Shape
+    Set shpOn = ws.Shapes.AddFormControl(xlButtonControl, 20, 20, 120, 28)
+    shpOn.Name = "btnExclTrigOn"
+    shpOn.TextFrame.Characters.Text = "ВКЛ триггер"
+    shpOn.OnAction = "'" & ThisWorkbook.Name & "'!ExclTrigger_Enable"
+
+
+    ' Добавим "ВЫКЛ"
+    Dim shpOff As Shape
+    Set shpOff = ws.Shapes.AddFormControl(xlButtonControl, 150, 20, 120, 28)
+    shpOff.Name = "btnExclTrigOff"
+    shpOff.TextFrame.Characters.Text = "ВЫКЛ триггер"
+    shpOff.OnAction = "'" & ThisWorkbook.Name & "'!ExclTrigger_Disable"
+
+
+    TRG_LogWrite "Кнопки управления триггером добавлены на лист '" & TARGET_SHEET_NAME & "'."
+    Call TRG_UpdateButtonsVisual
+    Exit Sub
+
+
+EH:
+    TRG_LogWrite "Ошибка ExclTrigger_AddButtons: " & Err.Number & " — " & Err.Description
+End Sub
+
+
+'------------------------------ ВНУТРЕННЕЕ API --------------------------------
+
+
+Private Sub TRG_SetEnabled(ByVal en As Boolean)
+    On Error GoTo EH
+
+
+    Dim nm As Name
+    Set nm = Nothing
+
+
+    On Error Resume Next
+    Set nm = ThisWorkbook.Names(TRG_NAME_ENABLED)
+    On Error GoTo EH
+
+
+    If nm Is Nothing Then
+        ThisWorkbook.Names.Add Name:=TRG_NAME_ENABLED, RefersTo:="=" & UCase$(CStr(en))
+    Else
+        nm.RefersTo = "=" & UCase$(CStr(en))
+    End If
+    Exit Sub
+
+
+EH:
+    TRG_LogWrite "Ошибка TRG_SetEnabled: " & Err.Number & " — " & Err.Description
+End Sub
+
+
+Private Function TRG_GetEnabledSafe() As Boolean
+    On Error GoTo Fallback
+
+
+    Dim nm As Name
+    Set nm = ThisWorkbook.Names(TRG_NAME_ENABLED)
+
+
+    If nm Is Nothing Then
+        TRG_GetEnabledSafe = True
+    Else
+        TRG_GetEnabledSafe = CBool(Evaluate(nm.RefersTo))
+    End If
+    Exit Function
+
+
+Fallback:
+    TRG_GetEnabledSafe = True
+End Function
+
+
+Private Sub TRG_UpdateButtonsVisual()
+    On Error Resume Next
+
+
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(TARGET_SHEET_NAME)
+    If ws Is Nothing Then Exit Sub
+
+
+    Dim en As Boolean
+    en = TRG_GetEnabledSafe()
+
+
+    Dim shpOn As Shape
+    Dim shpOff As Shape
+    Set shpOn = ws.Shapes("btnExclTrigOn")
+    Set shpOff = ws.Shapes("btnExclTrigOff")
+
+
+    If Not shpOn Is Nothing Then
+        shpOn.TextFrame.Characters.Text = IIf(en, "ВКЛ триггер ✓", "ВКЛ триггер")
+    End If
+
+
+    If Not shpOff Is Nothing Then
+        shpOff.TextFrame.Characters.Text = IIf(en, "ВЫКЛ триггер", "ВЫКЛ триггер ✓")
+    End If
+End Sub
+
+
+Private Sub TRG_SafeDeleteShape(ByVal ws As Worksheet, ByVal shpName As String)
+    On Error Resume Next
+    ws.Shapes(shpName).Delete
+    On Error GoTo 0
+End Sub
+
+
+'------------------------------- ЛОГИ ------------------------------------------
+
+
+Private Sub TRG_LogWrite(ByVal msg As String)
+    On Error Resume Next
+
+
+    Dim ws As Worksheet
+    Dim r As Long
+
+
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+
+
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "modExclTrigger_Toggle v1.0.1"
+    ws.Cells(r, 3).Value = msg
+End Sub

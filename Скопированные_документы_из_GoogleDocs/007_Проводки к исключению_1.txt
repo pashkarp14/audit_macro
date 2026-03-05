@@ -1,0 +1,904 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modExclusions_Fill
+' Версия:    1.2.4   (16.09.2025)
+'
+' Что нового в 1.2.4:
+'   - Оверрайд меппинга по пустой «Сумма» на уровне агрегата:
+'       если в группе (Проводка, Меппинг) встречались строки с пустой Сумма,
+'       при выводе меппинг принудительно = "Нулевая сумма",
+'       обоснование = "Проводка с нулевой суммой".
+'   - Добавлены логи ZeroSumOverrideOnOutput.
+'
+' Что нового в 1.2.3:
+'   - Добавлено правило: "Курсовые разницы"  -> "Переоценка валютных остатков".
+'   - Добавлено правило: "Взаимозачёт"       -> "Взаимозачет встречных требований".
+'
+' Что нового в 1.2.2:
+'   - Добавлено правило: меппинг "Популяция для тестирования" -> обоснование "Н.п.".
+'
+' Что нового в 1.2.0–1.2.1:
+'   - Отказ от внутренних правил меппинга. Берём «Меппинг» из ЖП_обработанный_*.
+'   - Агрегация по ключу (Проводка, Меппинг).
+'   - Заполнение 7-го столбца «Обоснование к исключению» по словарю ReasonByMapping.
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.2.4"
+
+
+Private Const DST_SHEET As String = "2. Проводки к исключению"
+Private Const PROCESSED_PREFIX As String = "ЖП_обработанный_"
+Private Const LOG_SHEET As String = "Логи"
+
+
+Private Const ANCHOR_TEXT As String = "Анализ проводок к исключению>>>"
+Private Const TOTAL_TEXT As String = "Итого"
+
+
+' Шапка приёмника: Проводка | Дт | Кт | Сумма | Сумма абс | Меппинг | Обоснование к исключению
+Private Const HEADER_COLS As Long = 7
+Private Const HEADER_HEIGHT As Long = 1
+Private Const ANCHOR_COL As Long = 2
+
+
+Private Const NUM_FMT As String = "# ##0;-# ##0;-"
+
+
+Private currentStep As String
+Private stepT As Double
+
+
+'========================================================================================
+' ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Заполнить_Проводки_К_Исключению()
+    Dim t0 As Double
+    t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean
+    Dim evt As Boolean
+    Dim alr As Boolean
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & "Заполнить_Проводки_К_Исключению v" & MacroVersion
+
+
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+
+    Dim wsDst As Worksheet
+    Set wsDst = wb.Worksheets(DST_SHEET)
+
+
+    ' ---------- Приёмник: якорь/границы ----------
+    StartStep "Поиск якоря и границ приёмника"
+    Dim anchorRow As Long
+    Dim headerTop As Long
+    Dim dataTop As Long
+    Dim totalRow As Long
+    Dim dataBottom As Long
+
+
+    anchorRow = FindFirstInColumnExact(wsDst, ANCHOR_COL, ANCHOR_TEXT)
+    If anchorRow = 0 Then Err.Raise 5, , "Якорь не найден: " & ANCHOR_TEXT
+
+
+    headerTop = anchorRow + 1
+    dataTop = headerTop + HEADER_HEIGHT
+    totalRow = FindFirstBelowInColumnExact(wsDst, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Or totalRow <= dataTop Then Err.Raise 5, , "Метка 'Итого' не найдена ниже шапки"
+    dataBottom = totalRow - 1
+
+
+    LogWrite NowStr() & vbTab & "? Приёмник" & vbTab & _
+        "AnchorRow=" & anchorRow & "; HeaderTop=" & headerTop & "; DataTop=" & dataTop & "; TotalRow=" & totalRow
+    EndStep
+
+
+    ' ---------- Источники ----------
+    StartStep "Поиск листов-источников ЖП_обработанный_*"
+    Dim srcSheets As Collection
+    Set srcSheets = GetProcessedSheets(wb, PROCESSED_PREFIX)
+    If srcSheets Is Nothing Or srcSheets.Count = 0 Then
+        LogWrite NowStr() & vbTab & "Внимание" & vbTab & "Листы '" & PROCESSED_PREFIX & "*' не найдены — нечего агрегировать"
+        GoTo FinishOK
+    End If
+    LogWrite NowStr() & vbTab & "Найдено источников" & vbTab & srcSheets.Count
+    EndStep
+
+
+    ' ---------- Агрегация по (Проводка, Меппинг) ----------
+    StartStep "Агрегация: ключ (Проводка, Меппинг) -> Сумма + флаг пустых 'Сумма'"
+    Dim dictSum As Object
+    Set dictSum = CreateObject("Scripting.Dictionary")
+    dictSum.CompareMode = vbTextCompare
+
+
+    Dim dictMapDisp As Object
+    Set dictMapDisp = CreateObject("Scripting.Dictionary")
+    dictMapDisp.CompareMode = vbTextCompare
+
+
+    ' Флаг: в группе встречались строки с пустой 'Сумма'
+    Dim dictHasBlankSum As Object
+    Set dictHasBlankSum = CreateObject("Scripting.Dictionary")
+    dictHasBlankSum.CompareMode = vbTextCompare
+
+
+    Dim order As New Collection
+
+
+    Dim cntRows As Long
+    Dim added As Long
+
+
+    Dim i As Long
+    For i = 1 To srcSheets.Count
+        AggregateFromProcessedSheetByMap srcSheets(i), dictSum, dictMapDisp, dictHasBlankSum, order, cntRows, added
+    Next i
+
+
+    LogWrite NowStr() & vbTab & "? Агрегация" & vbTab & _
+        "Всего строк источника=" & cntRows & "; Уникальных пар=" & dictSum.Count & "; Новых добавлено=" & added
+    EndStep
+
+
+    ' ---------- Подгонка строк ----------
+    StartStep "Подгонка количества строк приёмника"
+    Dim need As Long
+    need = dictSum.Count
+
+
+    Dim nRowsDst As Long
+    nRowsDst = dataBottom - dataTop + 1
+
+
+    Dim needIns As Long
+    Dim needDel As Long
+
+
+    If need < 0 Then need = 0
+    If nRowsDst < need Then
+        needIns = need - nRowsDst
+        wsDst.Rows(dataBottom).Resize(needIns).Insert xlShiftDown
+        totalRow = totalRow + needIns
+        dataBottom = dataTop + need - 1
+        LogWrite NowStr() & vbTab & "Вставлено строк" & vbTab & needIns
+    ElseIf nRowsDst > need Then
+        needDel = nRowsDst - need
+        wsDst.Rows(dataTop + need).Resize(needDel).Delete xlShiftUp
+        totalRow = totalRow - needDel
+        dataBottom = dataTop + need - 1
+        LogWrite NowStr() & vbTab & "Удалено лишних строк" & vbTab & needDel
+    Else
+        LogWrite NowStr() & vbTab & "Подгонка строк" & vbTab & "Не требуется"
+    End If
+    EndStep
+
+
+    ' ---------- Очистка рамки/подготовка ----------
+    StartStep "Очистка рамки и подготовка диапазонов"
+    Dim rngAll As Range
+    Set rngAll = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(IIf(dataBottom >= dataTop, dataBottom, dataTop), ANCHOR_COL + HEADER_COLS - 1))
+    rngAll.Borders.LineStyle = xlNone
+    rngAll.WrapText = False
+
+
+    If dataBottom >= dataTop Then
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 1), wsDst.Cells(dataBottom, ANCHOR_COL + 2)).NumberFormatLocal = NUM_FMT
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 3), wsDst.Cells(dataBottom, ANCHOR_COL + 4)).NumberFormatLocal = NUM_FMT
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 5), wsDst.Cells(dataBottom, ANCHOR_COL + 6)).NumberFormat = "@"
+    End If
+    EndStep
+
+
+    ' ---------- Заполнение 1–7 колонок ----------
+    StartStep "Заполнение данных (Проводка, Дт, Кт, Сумма, Сумма абс, Меппинг, Обоснование)"
+    If dictSum.Count > 0 Then
+        Dim n As Long
+        n = dictSum.Count
+
+
+        Dim outArr() As Variant
+        ReDim outArr(1 To n, 1 To 7)
+
+
+        Dim key As Variant
+        Dim r As Long
+        Dim prov As String
+        Dim mapCanon As String
+        Dim mapDisp As String
+        Dim dtS As String
+        Dim kcS As String
+        Dim ktS As String
+        Dim ktResolved As String
+        Dim sVal As Double
+        Dim kIdx As Long
+
+
+        Dim cntEmptyOnOutput As Long
+        Dim cntWithMapOnOutput As Long
+        Dim cntNP_PopTest As Long
+        Dim cntZeroOverrideOnOutput As Long
+
+
+        Dim popTestKey As String
+        popTestKey = CanonMapKey("Популяция для тестирования")
+
+
+        r = 1
+        For kIdx = 1 To order.Count
+            key = order(kIdx)
+            If dictSum.Exists(key) Then
+                SplitKeySimple CStr(key), prov, mapCanon
+
+
+                If dictMapDisp.Exists(CStr(key)) Then
+                    mapDisp = CStr(dictMapDisp(CStr(key)))
+                Else
+                    mapDisp = ""
+                End If
+
+
+                ParseProvodkaTokens prov, dtS, kcS, ktS
+
+
+                If Len(Trim$(ktS)) > 0 Then
+                    ktResolved = ktS
+                ElseIf Len(Trim$(kcS)) > 0 Then
+                    ktResolved = kcS
+                Else
+                    ktResolved = ""
+                End If
+
+
+                sVal = CDbl(dictSum(CStr(key)))
+
+
+                outArr(r, 1) = prov
+                outArr(r, 2) = IIf(Len(Trim$(dtS)) > 0, "'" & dtS, 0)
+                outArr(r, 3) = IIf(Len(Trim$(ktResolved)) > 0, "'" & ktResolved, 0)
+                outArr(r, 4) = sVal
+                outArr(r, 5) = Abs(sVal)
+
+
+                ' --- Оверрайд: если в группе были пустые "Сумма" -> Нулевая сумма ---
+                If dictHasBlankSum.Exists(CStr(key)) Then
+                    If CBool(dictHasBlankSum(CStr(key))) = True Then
+                        outArr(r, 6) = "Нулевая сумма"
+                        outArr(r, 7) = ReasonByMapping("Нулевая сумма")
+                        cntZeroOverrideOnOutput = cntZeroOverrideOnOutput + 1
+                    Else
+                        outArr(r, 6) = mapDisp
+                        outArr(r, 7) = ReasonByMapping(mapDisp)
+                    End If
+                Else
+                    outArr(r, 6) = mapDisp
+                    outArr(r, 7) = ReasonByMapping(mapDisp)
+                End If
+
+
+                If Len(mapDisp) = 0 Then
+                    cntEmptyOnOutput = cntEmptyOnOutput + 1
+                Else
+                    cntWithMapOnOutput = cntWithMapOnOutput + 1
+                    If CanonMapKey(mapDisp) = popTestKey And outArr(r, 7) = "Н.п." Then
+                        cntNP_PopTest = cntNP_PopTest + 1
+                    End If
+                End If
+
+
+                r = r + 1
+            End If
+        Next kIdx
+
+
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + 6)).Value = outArr
+
+
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + 3)).HorizontalAlignment = xlHAlignLeft
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 5), wsDst.Cells(dataBottom, ANCHOR_COL + 6)).HorizontalAlignment = xlHAlignLeft
+
+
+        LogWrite NowStr() & vbTab & "? Вывод" & vbTab & _
+            "Строк=" & n & "; с меппингом=" & cntWithMapOnOutput & "; без меппинга=" & cntEmptyOnOutput & _
+            "; Н.п._по_«Популяция для тестирования»=" & cntNP_PopTest & _
+            "; ZeroSumOverrideOnOutput=" & cntZeroOverrideOnOutput
+    End If
+    EndStep
+
+
+    ' ---------- Итоги и рамка ----------
+    StartStep "Строка 'Итого' и рамка"
+    If dataBottom >= dataTop Then
+        Dim rngSum As Range
+
+
+        Set rngSum = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 3), wsDst.Cells(dataBottom, ANCHOR_COL + 3))
+        wsDst.Cells(totalRow, ANCHOR_COL + 3).FormulaLocal = "=СУММ(" & rngSum.Address(False, False) & ")"
+        wsDst.Cells(totalRow, ANCHOR_COL + 3).NumberFormatLocal = NUM_FMT
+
+
+        Set rngSum = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 4), wsDst.Cells(dataBottom, ANCHOR_COL + 4))
+        wsDst.Cells(totalRow, ANCHOR_COL + 4).FormulaLocal = "=СУММ(" & rngSum.Address(False, False) & ")"
+        wsDst.Cells(totalRow, ANCHOR_COL + 4).NumberFormatLocal = NUM_FMT
+
+
+        With rngAll.Borders(xlEdgeLeft)
+            .LineStyle = xlContinuous
+            .Weight = xlThick
+            .Color = RGB(0, 0, 0)
+        End With
+        With rngAll.Borders(xlEdgeRight)
+            .LineStyle = xlContinuous
+            .Weight = xlThick
+            .Color = RGB(0, 0, 0)
+        End With
+        With rngAll.Borders(xlEdgeTop)
+            .LineStyle = xlContinuous
+            .Weight = xlThick
+            .Color = RGB(0, 0, 0)
+        End With
+        With rngAll.Borders(xlEdgeBottom)
+            .LineStyle = xlContinuous
+            .Weight = xlThick
+            .Color = RGB(0, 0, 0)
+        End With
+    End If
+    EndStep
+
+
+FinishOK:
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & _
+        "Уникальных пар (Проводка,Меппинг)=" & dictCountSafe(dictSum) & _
+        "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'========================================================================================
+' АГРЕГАЦИЯ ИСТОЧНИКОВ: ключ = Проводка ? Меппинг(канон)
+'========================================================================================
+Private Sub AggregateFromProcessedSheetByMap( _
+    ByVal wsSrc As Worksheet, _
+    ByRef dictSum As Object, _
+    ByRef dictMapDisp As Object, _
+    ByRef dictHasBlankSum As Object, _
+    ByRef order As Collection, _
+    ByRef cntRows As Long, _
+    ByRef added As Long)
+
+
+    On Error GoTo SafeExit
+
+
+    Dim cProv As Long
+    Dim cSum As Long
+    Dim cMap As Long
+
+
+    cProv = FindHeaderCol(wsSrc, "Проводка")
+    cSum = FindHeaderSyn(wsSrc, Array("Сумма", " сумма", "сумма "))
+    cMap = FindHeaderSyn(wsSrc, Array("Меппинг", "меппинг", "mapping"))
+
+
+    If cProv = 0 Or cSum = 0 Or cMap = 0 Then
+        LogWrite NowStr() & vbTab & "Пропуск листа (нет заголовков)" & vbTab & wsSrc.name & _
+            "  Проводка=" & cProv & "  Сумма=" & cSum & "  Меппинг=" & cMap
+        Exit Sub
+    End If
+
+
+    Dim lr As Long
+    lr = LastDataRowOnCols(wsSrc, Array(cProv, cSum, cMap))
+    If lr < 2 Then Exit Sub
+
+
+    Dim minC As Long
+    Dim maxC As Long
+    minC = cProv
+    maxC = cProv
+    If cSum < minC Then minC = cSum
+    If cMap < minC Then minC = cMap
+    If cSum > maxC Then maxC = cSum
+    If cMap > maxC Then maxC = cMap
+
+
+    Dim block As Variant
+    block = wsSrc.Range(wsSrc.Cells(1, minC), wsSrc.Cells(lr, maxC)).Value2
+
+
+    Dim provIdx As Long
+    Dim sumIdx As Long
+    Dim mapIdx As Long
+    provIdx = cProv - minC + 1
+    sumIdx = cSum - minC + 1
+    mapIdx = cMap - minC + 1
+
+
+    Dim r As Long
+    Dim prov As String
+    Dim mapDisp As String
+    Dim mapCanon As String
+    Dim key As String
+    Dim valSum As Double
+
+
+    Dim cntEmptyMap As Long
+    Dim cntWithMap As Long
+    Dim isBlank As Boolean
+
+
+    For r = 2 To lr
+        cntRows = cntRows + 1
+
+
+        prov = Trim$(CStr(block(r, provIdx)))
+        If LenB(prov) = 0 Then GoTo NextR
+
+
+        mapDisp = Trim$(CStr(block(r, mapIdx)))
+        mapCanon = CanonMapKey(mapDisp)
+
+
+        If LenB(mapCanon) = 0 Then
+            cntEmptyMap = cntEmptyMap + 1
+        Else
+            cntWithMap = cntWithMap + 1
+        End If
+
+
+        ' Пустая "Сумма"?
+        isBlank = IsBlankLike(block(r, sumIdx))
+
+
+        If IsNumeric(block(r, sumIdx)) Then
+            valSum = CDbl(block(r, sumIdx))
+        Else
+            valSum = ToDoubleSafe(block(r, sumIdx))
+        End If
+        If isBlank Then valSum = 0#
+
+
+        key = prov & vbNullChar & mapCanon
+
+
+        If dictSum.Exists(key) Then
+            dictSum(key) = CDbl(dictSum(key)) + valSum
+        Else
+            dictSum.Add key, valSum
+            If Not dictMapDisp.Exists(key) Then dictMapDisp.Add key, mapDisp
+            order.Add key
+            added = added + 1
+        End If
+
+
+        ' Отметим, что в группе была пустая "Сумма"
+        If isBlank Then
+            If dictHasBlankSum.Exists(key) Then
+                If dictHasBlankSum(key) = False Then dictHasBlankSum(key) = True
+            Else
+                dictHasBlankSum.Add key, True
+            End If
+        End If
+NextR:
+    Next r
+
+
+    LogWrite NowStr() & vbTab & "Источник " & wsSrc.name & vbTab & _
+        "Строк: " & (lr - 1) & "; Меппинг пустых=" & cntEmptyMap & "; Меппинг заполненных=" & cntWithMap
+
+
+SafeExit:
+End Sub
+
+
+Private Sub SplitKeySimple(ByVal key As String, ByRef prov As String, ByRef mapCanon As String)
+    Dim p As Long
+    p = InStr(1, key, vbNullChar, vbBinaryCompare)
+    If p > 0 Then
+        prov = Left$(key, p - 1)
+        mapCanon = Mid$(key, p + 1)
+    Else
+        prov = key
+        mapCanon = ""
+    End If
+End Sub
+
+
+'========================================================================================
+' ПАРСЕР ПРОВОДКИ
+'========================================================================================
+Private Sub ParseProvodkaTokens(ByVal s As String, ByRef dtOut As String, ByRef kcOut As String, ByRef ktOut As String)
+    Dim txt As String
+    txt = NormalizeSpaces(s)
+
+
+    Dim parts() As String
+    parts = Split(txt, " ")
+
+
+    Dim i As Long
+    dtOut = ""
+    kcOut = ""
+    ktOut = ""
+
+
+    For i = LBound(parts) To UBound(parts)
+        Select Case LCase$(parts(i))
+            Case "дт"
+                If i + 1 <= UBound(parts) Then
+                    If IsTag(parts(i + 1)) Then
+                        If LCase$(parts(i + 1)) = "кц" And (i + 2 > UBound(parts) Or IsTag(parts(i + 2))) Then
+                            dtOut = "КЦ"
+                        End If
+                    Else
+                        dtOut = CleanAcc(parts(i + 1))
+                    End If
+                End If
+
+
+            Case "кц"
+                If i + 1 <= UBound(parts) Then
+                    If Not IsTag(parts(i + 1)) Then
+                        kcOut = CleanAcc(parts(i + 1))
+                    End If
+                End If
+
+
+            Case "кт"
+                If i + 1 <= UBound(parts) Then
+                    If Not IsTag(parts(i + 1)) Then
+                        ktOut = CleanAcc(parts(i + 1))
+                    End If
+                End If
+        End Select
+    Next i
+End Sub
+
+
+Private Function IsTag(ByVal token As String) As Boolean
+    Dim t As String
+    t = LCase$(Trim$(token))
+    IsTag = (t = "дт" Or t = "кт" Or t = "кц")
+End Function
+
+
+Private Function CleanAcc(ByVal s As String) As String
+    Dim v As String
+    v = Trim$(s)
+    Do While Len(v) > 0 And InStr(";,", Right$(v, 1)) > 0
+        v = Left$(v, Len(v) - 1)
+    Loop
+    CleanAcc = v
+End Function
+
+
+Private Function NormalizeSpaces(ByVal s As String) As String
+    Dim nb As String
+    nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeSpaces = s
+End Function
+
+
+'========================================================================================
+' МЕППИНГ > ОБОСНОВАНИЕ
+'========================================================================================
+Private Function ReasonByMapping(ByVal mapDisp As String) As String
+    Static d As Object
+    If d Is Nothing Then
+        Set d = CreateObject("Scripting.Dictionary")
+        d.CompareMode = vbTextCompare
+        d.Add CanonMapKey("Налоги"), "Типовые проводки по налогам"
+        d.Add CanonMapKey("Налоговые активы"), "Типовые проводки по ОНА"
+        d.Add CanonMapKey("Налоговые обязательства"), "Типовые проводки по ОНО"
+        d.Add CanonMapKey("Соц. взносы"), "Соц. взносы"
+        d.Add CanonMapKey("Внутренний оборот"), "Внутренний оборот"
+        d.Add CanonMapKey("Внутренние движения по ОС"), "Внутренние движения по ОС"
+        d.Add CanonMapKey("Внутренние движения по НМА"), "Внутренние движения по НМА"
+        d.Add CanonMapKey("Начисление процентов"), "Начисление процентов"
+        d.Add CanonMapKey("Амортизация"), "Типовые проводки по амортизации"
+        d.Add CanonMapKey("Денежные средства"), "Обороты внутри счетов денежных средств"
+        d.Add CanonMapKey("Оплата труда"), "Оплата труда"
+        d.Add CanonMapKey("Реформация/финрезультат"), "Реформация и формирование фин. результата"
+        d.Add CanonMapKey("Резервы"), "Резервы"
+        d.Add CanonMapKey("Списание материалов"), "Списание материальных затрат"
+        d.Add CanonMapKey("Затраты/ГП — внутри"), "Внутренние проводки между счетами затрат и ГП"
+        d.Add CanonMapKey("Забалансовые операции"), "Забалансовые операции"
+        d.Add CanonMapKey("Внутри запасов"), "Операции внутри счетов запасов"
+        d.Add CanonMapKey("Расчёты / Взаимозачёт"), "Взаимозачет встречных требований или Операции внутри счетов расчетов"
+        d.Add CanonMapKey("Списание РБП"), "Списание РБП"
+        d.Add CanonMapKey("Списание расходов"), "Списание расходов"
+        d.Add CanonMapKey("Курсовые разницы"), "Переоценка валютных остатков"
+        d.Add CanonMapKey("Взаимозачёт"), "Взаимозачет встречных требований"
+        d.Add CanonMapKey("Нулевая сумма"), "Проводка с нулевой суммой"
+        d.Add CanonMapKey("Популяция для тестирования"), "Н.п."
+    End If
+
+
+    Dim key As String
+    key = CanonMapKey(mapDisp)
+    If d.Exists(key) Then
+        ReasonByMapping = CStr(d(key))
+    Else
+        ReasonByMapping = ""
+    End If
+End Function
+
+
+Private Function CanonMapKey(ByVal s As String) As String
+    Dim nb As String
+    nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, "—", "-")
+    s = Replace$(s, "–", "-")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    CanonMapKey = LCase$(s)
+End Function
+
+
+'========================================================================================
+' ПОИСК/ДИАПАЗОНЫ/ЧИСЛО/ЛОГИ
+'========================================================================================
+Private Function GetProcessedSheets(ByVal wb As Workbook, ByVal prefix As String) As Collection
+    Dim col As New Collection
+    Dim sh As Worksheet
+    Dim idx As Long
+    Dim nm As String
+    For Each sh In wb.Worksheets
+        nm = sh.name
+        If Left$(nm, Len(prefix)) = prefix Then
+            idx = val(Mid$(nm, Len(prefix) + 1))
+            If idx > 0 Then Call InsertByIndex(col, sh, idx)
+        End If
+    Next sh
+    Set GetProcessedSheets = col
+End Function
+
+
+Private Sub InsertByIndex(ByRef coll As Collection, ByVal ws As Worksheet, ByVal idx As Long)
+    Dim i As Long
+    Dim added As Boolean
+    added = False
+    For i = 1 To coll.Count
+        If val(Mid$(coll(i).name, Len(PROCESSED_PREFIX) + 1)) > idx Then
+            coll.Add ws, , i
+            added = True
+            Exit Sub
+        End If
+    Next i
+    If Not added Then coll.Add ws
+End Sub
+
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String) As Long
+    Dim c As Range
+    Set c = ws.Rows(1).Find(What:=headerName, LookAt:=xlWhole, LookIn:=xlValues, MatchCase:=False)
+    If c Is Nothing Then
+        FindHeaderCol = 0
+    Else
+        FindHeaderCol = c.Column
+    End If
+End Function
+
+
+Private Function FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant) As Long
+    Dim lastCol As Long
+    Dim j As Long
+    Dim key As String
+    Dim i As Long
+
+
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        key = NormalizeHeaderText(CStr(ws.Cells(1, j).Value))
+        If key <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                If key = NormalizeHeaderText(CStr(syns(i))) Then
+                    FindHeaderSyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+End Function
+
+
+Private Function LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long
+    Dim j As Long
+    Dim lrj As Long
+    Dim c As Long
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    LastDataRowOnCols = lr
+End Function
+
+
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range
+    Dim f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long
+    Dim rng As Range
+    Dim f As Range
+    lastRow = ws.Rows.Count
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstBelowInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstBelowInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function ToDoubleSafe(ByVal v As Variant) As Double
+    On Error GoTo Fallback
+    If IsNumeric(v) Then
+        ToDoubleSafe = CDbl(v)
+        Exit Function
+    End If
+    Dim s As String
+    Dim nb As String
+    s = CStr(v)
+    nb = Chr$(160)
+    s = Replace$(s, nb, "")
+    s = Replace$(s, " ", "")
+    s = Replace$(s, ",", Application.International(xlDecimalSeparator))
+    ToDoubleSafe = CDbl(s)
+    Exit Function
+Fallback:
+    ToDoubleSafe = 0#
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String
+    nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = LCase$(s)
+End Function
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Dim r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function
+
+
+Private Function dictCountSafe(ByVal d As Object) As Long
+    On Error Resume Next
+    dictCountSafe = d.Count
+End Function
+
+
+'========================================================================================
+' ВСПОМОГАТЕЛЬНОЕ: детектор «визуально пустой» суммы
+'========================================================================================
+Private Function IsBlankLike(ByVal v As Variant) As Boolean
+    If IsEmpty(v) Then
+        IsBlankLike = True
+        Exit Function
+    End If
+    On Error GoTo Fallback
+    If VarType(v) = vbString Then
+        Dim s As String
+        s = CStr(v)
+        s = Replace$(s, Chr$(160), " ")
+        s = Trim$(s)
+        IsBlankLike = (LenB(s) = 0)
+        Exit Function
+    End If
+    ' Числовые/прочие типы считаем не пустыми
+    IsBlankLike = False
+    Exit Function
+Fallback:
+    IsBlankLike = False
+End Function

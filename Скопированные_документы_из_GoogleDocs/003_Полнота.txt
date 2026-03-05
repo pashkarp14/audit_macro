@@ -1,0 +1,525 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modPolnota_JP_Fill
+' Версия:    1.5.0   (11.09.2025)
+'
+' Изменения 1.5.0 (ускорение):
+'   - Формулы записываются через .FormulaR1C1 (англ. функции) без локализации.
+'   - SUMIF считают НЕ по целым столбцам, а по реальному диапазону данных каждого ЖП_Ч:
+'       'R2C{Dt}:R{last}C{Dt}' и 'R2C{Sum}:R{last}C{Sum}'
+'   - Критерий фиксирован на колонку B текущей строки: RC2 (даёт B{row}).
+'   - Подробные логи по lastRow и объёму формул.
+'
+' Логика:
+'   - 0 в 9–12 ставится для любого счёта S, если ниже есть строки S.* (включая уровни 10.11 → 10.11.*).
+'   - Иначе 9/10 — сумма по ЖП_Ч*, 11 = [5] - [9], 12 = [6] - [10].
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.5.0"
+
+
+' --- Пользовательские константы ---
+Private Const DST_SHEET As String = "1. Полнота"
+Private Const SRC_SHEET As String = "ОСВ 12м2024"
+
+
+Private Const ANCHOR_TEXT As String = "Проверка полноты журнала проводок>>>"
+Private Const TOTAL_TEXT As String = "Итого"
+
+
+Private Const HEADER_HEIGHT As Long = 2
+Private Const HEADER_COLS As Long = 12
+Private Const ANCHOR_COL As Long = 2
+Private Const COPY_COLUMNS As Long = 8
+
+
+' --- Технические поля для логирования этапов ---
+Private currentStep As String
+Private stepT As Double
+
+
+'========================================================================================
+' ПУБЛИЧНЫЙ ВХОД
+'========================================================================================
+Public Sub Заполнить_Полноту_Журнала_Проводок()
+    Dim t0 As Double: t0 = Timer
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean
+    On Error GoTo EH
+    
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & "Заполнить_Полноту_Журнала_Проводок v" & MacroVersion
+    
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim wsDst As Worksheet: Set wsDst = wb.Worksheets(DST_SHEET)
+    Dim wsSrc As Worksheet: Set wsSrc = wb.Worksheets(SRC_SHEET)
+    
+    ' ---------------- Приёмник: якорь/границы ----------------
+    StartStep "Поиск якоря и границ приёмника"
+    Dim anchorRow As Long, headerTop As Long, dataTop As Long
+    Dim totalRow As Long, dataBottom As Long
+    anchorRow = FindFirstInColumnExact(wsDst, ANCHOR_COL, ANCHOR_TEXT)
+    If anchorRow = 0 Then Err.Raise 5, , "Якорь на приёмнике не найден: " & ANCHOR_TEXT
+    
+    headerTop = anchorRow + 2
+    dataTop = headerTop + HEADER_HEIGHT
+    totalRow = FindFirstBelowInColumnExact(wsDst, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Then Err.Raise 5, , "Метка 'Итого' на приёмнике не найдена ниже шапки"
+    dataBottom = totalRow - 1
+    
+    LogWrite NowStr() & vbTab & "? Приёмник" & vbTab & _
+        "AnchorRow=" & anchorRow & "; HeaderTop=" & headerTop & "; DataTop=" & dataTop & "; TotalRow=" & totalRow
+    EndStep
+    
+    ' ---------------- Источник ОСВ: 01..Итого ----------------
+    StartStep "Определение источника ОСВ 12м2024: блок 01..Итого"
+    Dim startColOSV As Long, startRowOSV As Long, endRowOSV As Long
+    Dim nRowsSrc As Long
+    startRowOSV = FindFirstInColumnExact(wsSrc, 1, "01")
+    startColOSV = 1
+    If startRowOSV = 0 Then
+        startRowOSV = FindFirstInColumnExact(wsSrc, 2, "01")
+        startColOSV = 2
+        If startRowOSV = 0 Then Err.Raise 5, , "В источнике не найдена стартовая ячейка '01' (ни в кол.1, ни в кол.2)"
+    End If
+    endRowOSV = FindFirstBelowInColumnExact(wsSrc, startColOSV, TOTAL_TEXT, startRowOSV + 1)
+    If endRowOSV = 0 Then Err.Raise 5, , "В источнике не найден низ блока по 'Итого'"
+    nRowsSrc = endRowOSV - startRowOSV
+    If nRowsSrc <= 0 Then Err.Raise 5, , "Некорректные границы источника (нулевая длина)"
+    LogWrite NowStr() & vbTab & "? Источник ОСВ" & vbTab & _
+        "Start=(" & startRowOSV & "," & startColOSV & "); EndRow(Itogo)=" & endRowOSV & "; Rows=" & nRowsSrc
+    EndStep
+    
+    ' ---------------- Подгонка строк ----------------
+    StartStep "Подгонка количества строк приёмника"
+    Dim nRowsDst As Long, needIns As Long, needDel As Long
+    nRowsDst = dataBottom - dataTop + 1
+    If nRowsDst < 0 Then nRowsDst = 0
+    If nRowsDst < nRowsSrc Then
+        needIns = nRowsSrc - nRowsDst
+        wsDst.Rows(dataBottom).Resize(needIns).Insert xlShiftDown
+        totalRow = totalRow + needIns
+        dataBottom = dataTop + nRowsSrc - 1
+        LogWrite NowStr() & vbTab & "Вставлено строк" & vbTab & needIns
+    ElseIf nRowsDst > nRowsSrc Then
+        needDel = nRowsDst - nRowsSrc
+        wsDst.Rows(dataTop + nRowsSrc).Resize(needDel).Delete xlShiftUp
+        totalRow = totalRow - needDel
+        dataBottom = dataTop + nRowsSrc - 1
+        LogWrite NowStr() & vbTab & "Удалено лишних строк" & vbTab & needDel
+    Else
+        LogWrite NowStr() & vbTab & "Подгонка строк" & vbTab & "Не требуется (равны)"
+    End If
+    EndStep
+    
+    ' ---------------- Подготовка области ----------------
+    StartStep "Очистка рамки и подготовка диапазонов"
+    Dim rngAll As Range
+    Set rngAll = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + HEADER_COLS - 1))
+    rngAll.Borders.LineStyle = xlNone
+    rngAll.WrapText = False
+    EndStep
+    
+    ' ---------------- 1–2 колонки (с форматами) ----------------
+    StartStep "Копирование 1–2 колонок (с форматами) из ОСВ"
+    Dim src12 As Range, dst12 As Range
+    Set src12 = wsSrc.Range(wsSrc.Cells(startRowOSV, startColOSV), wsSrc.Cells(endRowOSV - 1, startColOSV + 1))
+    Set dst12 = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + 1))
+    src12.Copy Destination:=dst12
+    dst12.WrapText = False
+    EndStep
+    
+    ' ---------------- 3–8 колонки (значения, формат) ----------------
+    StartStep "Заливка 3–8 колонок значениями и форматами"
+    Dim src38 As Range, dst38 As Range, v38 As Variant
+    Set src38 = wsSrc.Range(wsSrc.Cells(startRowOSV, startColOSV + 2), wsSrc.Cells(endRowOSV - 1, startColOSV + 7))
+    Set dst38 = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 2), wsDst.Cells(dataBottom, ANCHOR_COL + 7))
+    v38 = src38.Value2
+    Dim i As Long, j As Long
+    For i = 1 To UBound(v38, 1)
+        For j = 1 To UBound(v38, 2)
+            If IsEmpty(v38(i, j)) Then
+                v38(i, j) = 0
+            ElseIf VarType(v38(i, j)) = vbString Then
+                v38(i, j) = CoerceToDouble(v38(i, j))
+            End If
+            If IsError(v38(i, j)) Or IsEmpty(v38(i, j)) Then v38(i, j) = 0
+        Next j
+    Next i
+    dst38.Value2 = v38
+    dst38.NumberFormatLocal = "# ##0;-# ##0;-"
+    dst38.WrapText = False
+    EndStep
+    
+    ' ---------------- Маска: у каких строк есть "дети ниже" ----------------
+    StartStep "Расчёт маски: есть ли подсчёты ниже"
+    Dim accArr As Variant
+    accArr = wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL)).Value2
+    
+    Dim nRows As Long: nRows = dataBottom - dataTop + 1
+    Dim hasChildBelow() As Boolean: ReDim hasChildBelow(1 To nRows)
+    Dim seenBelow As Object: Set seenBelow = CreateObject("Scripting.Dictionary")
+    seenBelow.CompareMode = vbTextCompare
+    
+    Dim sAcc As String
+    For i = nRows To 1 Step -1
+        sAcc = NzStr(accArr(i, 1))
+        hasChildBelow(i) = seenBelow.Exists(sAcc)
+        AddAllParentPrefixes seenBelow, sAcc
+    Next i
+    EndStep
+    
+    ' ---------------- Поиск ЖП_Ч* и построение "узких" SUMIF ----------------
+    StartStep "Поиск листов ЖП_Ч* и их колонок (Счет Дт/Счет Кт/Сумма)"
+    Dim sh As Worksheet
+    Dim partDt As Collection, partKt As Collection
+    Set partDt = New Collection
+    Set partKt = New Collection
+    
+    Dim cDt As Long, cKt As Long, cSum As Long, lastRow As Long
+    Dim foundJP As Long: foundJP = 0
+    For Each sh In wb.Worksheets
+        If InStr(1, sh.Name, "ЖП_Ч", vbTextCompare) > 0 Then
+            cDt = FindHeaderNormalized(sh, HeaderSynonyms_Dt())
+            cKt = FindHeaderNormalized(sh, HeaderSynonyms_Kt())
+            cSum = FindHeaderNormalized(sh, HeaderSynonyms_Sum())
+            If cDt > 0 And cKt > 0 And cSum > 0 Then
+                ' Определяем низ данных по столбцу суммы
+                lastRow = sh.Cells(sh.Rows.Count, cSum).End(xlUp).Row
+                If lastRow < 2 Then lastRow = 2 ' на всякий случай
+                foundJP = foundJP + 1
+                ' Узкие диапазоны вместо целых столбцов; критерий = RC2 (B{row})
+                partDt.Add "SUMIF('" & sh.Name & "'!R2C" & cDt & ":R" & lastRow & "C" & cDt & ",RC2,'" & sh.Name & "'!R2C" & cSum & ":R" & lastRow & "C" & cSum & ")"
+                partKt.Add "SUMIF('" & sh.Name & "'!R2C" & cKt & ":R" & lastRow & "C" & cKt & ",RC2,'" & sh.Name & "'!R2C" & cSum & ":R" & lastRow & "C" & cSum & ")"
+                
+                LogWrite NowStr() & vbTab & "ЖП_Ч OK" & vbTab & sh.Name & _
+                    "  CДт=" & cDt & "  CКт=" & cKt & "  CСумма=" & cSum & "  lastRow=" & lastRow
+            Else
+                LogWrite NowStr() & vbTab & "Пропуск листа (нет заголовков)" & vbTab & sh.Name & " — Row1: " & Row1HeadersDebug(sh)
+            End If
+        End If
+    Next sh
+    
+    Dim fDt As String, fKt As String
+    If partDt.Count > 0 Then fDt = "=" & JoinCollection(partDt, "+") Else fDt = "0"
+    If partKt.Count > 0 Then fKt = "=" & JoinCollection(partKt, "+") Else fKt = "0"
+    LogWrite NowStr() & vbTab & "? Формулы" & vbTab & "DtParts=" & partDt.Count & "; KtParts=" & partKt.Count
+    EndStep
+    
+    ' ---------------- Заполнение 9–12 (массово, R1C1) ----------------
+    StartStep "Заполнение 9–12 колонок"
+    Dim arr9(), arr10(), arr11(), arr12()
+    ReDim arr9(1 To nRows, 1 To 1)
+    ReDim arr10(1 To nRows, 1 To 1)
+    ReDim arr11(1 To nRows, 1 To 1)
+    ReDim arr12(1 To nRows, 1 To 1)
+    
+    Dim zeroCnt As Long, formCnt As Long
+    For i = 1 To nRows
+        If hasChildBelow(i) Then
+            arr9(i, 1) = "0"
+            arr10(i, 1) = "0"
+            arr11(i, 1) = "0"
+            arr12(i, 1) = "0"
+            zeroCnt = zeroCnt + 1
+        Else
+            arr9(i, 1) = fDt
+            arr10(i, 1) = fKt
+            arr11(i, 1) = "=RC[-6]-RC[-2]"
+            arr12(i, 1) = "=RC[-6]-RC[-2]"
+            formCnt = formCnt + 1
+        End If
+    Next i
+    
+    With wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 8), wsDst.Cells(dataBottom, ANCHOR_COL + 8))
+        .FormulaR1C1 = arr9                 ' англ. функции, R1C1
+        .NumberFormatLocal = "# ##0;-# ##0;-"
+        .WrapText = False
+    End With
+    With wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 9), wsDst.Cells(dataBottom, ANCHOR_COL + 9))
+        .FormulaR1C1 = arr10
+        .NumberFormatLocal = "# ##0;-# ##0;-"
+        .WrapText = False
+    End With
+    With wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 10), wsDst.Cells(dataBottom, ANCHOR_COL + 10))
+        .FormulaR1C1 = arr11
+        .NumberFormatLocal = "# ##0;-# ##0;-"
+        .WrapText = False
+    End With
+    With wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL + 11), wsDst.Cells(dataBottom, ANCHOR_COL + 11))
+        .FormulaR1C1 = arr12
+        .NumberFormatLocal = "# ##0;-# ##0;-"
+        .WrapText = False
+    End With
+    LogWrite NowStr() & vbTab & "? 9–12" & vbTab & "Формул=" & formCnt & "; Нулей=" & zeroCnt
+    EndStep
+    
+    ' ---------------- Внешняя рамка ----------------
+    StartStep "Толстая внешняя рамка вокруг всей вставки"
+    With rngAll.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rngAll.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rngAll.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rngAll.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    EndStep
+    
+    ' ---------------- Строка Итого ----------------
+    StartStep "Строка 'Итого': формулы СУММ по 3–12 колонкам"
+    Dim c As Long, rngSum As Range
+    For c = ANCHOR_COL + 2 To ANCHOR_COL + 11
+        Set rngSum = wsDst.Range(wsDst.Cells(dataTop, c), wsDst.Cells(dataBottom, c))
+        wsDst.Cells(totalRow, c).FormulaLocal = "=СУММ(" & rngSum.Address(False, False) & ")"
+        wsDst.Cells(totalRow, c).NumberFormatLocal = "# ##0;-# ##0;-"
+        wsDst.Cells(totalRow, c).WrapText = False
+    Next c
+    EndStep
+    
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & "Строк обработано=" & (dataBottom - dataTop + 1) & _
+        "; Время, сек=" & Format$(Timer - t0, "0.00")
+    
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.Calculation = appCalc
+    Exit Sub
+    
+EH:
+    LogWrite NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'========================================================================================
+' ВСПОМОГАТЕЛЬНЫЕ ПРОЦЕДУРЫ/ФУНКЦИИ
+'========================================================================================
+
+
+' ЛОГИ
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets("Логи")
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = "Логи"
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function
+
+
+' Поиск якорей/Итого
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long: lastRow = ws.Rows.Count
+    Dim rng As Range, f As Range
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstBelowInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstBelowInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+' ---------- Нормализация и поиск заголовков в строке 1 ----------
+Private Function HeaderSynonyms_Dt() As Variant
+    HeaderSynonyms_Dt = Array("счет дт", "счёт дт")
+End Function
+Private Function HeaderSynonyms_Kt() As Variant
+    HeaderSynonyms_Kt = Array("счет кт", "счёт кт")
+End Function
+Private Function HeaderSynonyms_Sum() As Variant
+    HeaderSynonyms_Sum = Array("сумма", " сумма", "сумма ")
+End Function
+
+
+Private Function FindHeaderNormalized(ByVal ws As Worksheet, ByVal synonyms As Variant) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then Exit Function
+    
+    Dim syn() As String, i As Long
+    ReDim syn(LBound(synonyms) To UBound(synonyms))
+    For i = LBound(synonyms) To UBound(synonyms)
+        syn(i) = NormalizeHeaderText(CStr(synonyms(i)))
+    Next i
+    
+    For c = 1 To lastCol
+        Dim norm As String
+        norm = NormalizeHeaderText(CStr(ws.Cells(1, c).Value))
+        If norm <> "" Then
+            For i = LBound(syn) To UBound(syn)
+                If norm = syn(i) Then
+                    FindHeaderNormalized = c
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next c
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = LCase$(s)
+End Function
+
+
+Private Function Row1HeadersDebug(ByVal ws As Worksheet) As String
+    On Error Resume Next
+    Dim lastCol As Long: lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    Dim lst As String, c As Long, txt As String
+    For c = 1 To lastCol
+        txt = NormalizeHeaderText(CStr(ws.Cells(1, c).Value))
+        If c > 1 Then lst = lst & " | "
+        lst = lst & "[" & c & ":" & txt & "]"
+        If Len(lst) > 800 Then Exit For
+    Next c
+    Row1HeadersDebug = lst
+End Function
+
+
+' ---------- Числовая конверсия ----------
+Private Function CoerceToDouble(ByVal v As Variant) As Variant
+    Dim s As String: s = CStr(v)
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, "")
+    s = Replace$(s, " ", "")
+    Dim decLoc As String: decLoc = Application.International(xlDecimalSeparator)
+    If InStr(s, ",") > 0 And InStr(s, ".") > 0 Then
+        If InStrRev(s, ",") > InStrRev(s, ".") Then
+            s = Replace$(s, ".", "")
+            s = Replace$(s, ",", decLoc)
+        Else
+            s = Replace$(s, ",", "")
+            s = Replace$(s, ".", decLoc)
+        End If
+    ElseIf InStr(s, ",") > 0 Then
+        s = Replace$(s, ",", decLoc)
+    ElseIf InStr(s, ".") > 0 Then
+        s = Replace$(s, ".", decLoc)
+    End If
+    If s = "" Or s = "-" Then
+        CoerceToDouble = 0
+        Exit Function
+    End If
+    On Error GoTo Fallback
+    CoerceToDouble = CDbl(s)
+    Exit Function
+Fallback:
+    CoerceToDouble = 0
+End Function
+
+
+' ---------- Префиксы: добавить все родительские префиксы строки ----------
+Private Sub AddAllParentPrefixes(ByVal dict As Object, ByVal acc As String)
+    Dim p As Long, s As String
+    s = acc
+    Do
+        p = InStrRev(s, ".")
+        If p <= 0 Then Exit Do
+        s = Left$(s, p - 1)
+        If Len(s) > 0 Then If Not dict.Exists(s) Then dict.Add s, True
+    Loop
+    ' Пример: "10.11.1" добавит "10.11" и "10"
+End Sub
+
+
+' ---------- Прочее ----------
+Private Function NzStr(ByVal v As Variant) As String
+    If IsError(v) Then
+        NzStr = ""
+    ElseIf IsEmpty(v) Then
+        NzStr = ""
+    Else
+        NzStr = Trim$(CStr(v))
+    End If
+End Function
+
+
+Private Function JoinCollection(ByVal coll As Collection, ByVal sep As String) As String
+    Dim i As Long, tmp As String
+    For i = 1 To coll.Count
+        If i > 1 Then tmp = tmp & sep
+        tmp = tmp & CStr(coll(i))
+    Next i
+    JoinCollection = tmp
+End Function
+'========================================================================================
+' КОНЕЦ МОДУЛЯ
+'========================================================================================

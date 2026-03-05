@@ -1,0 +1,739 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:  Рандом_выборка_РО_по_вводу_доходов
+' Версия:  1.6.8  (22.09.2025)
+'
+' Требует: modRandCore v1.0+ (RC_NormalizeSeed, RC_PM_Next01, RC_ShuffleFY, RC_RandPick, RC_RandPermN)
+'
+' Источник данных:  "РО по вводу доходов попул 3л" (шапка в 1-й строке)
+' Лист настроек:    "10. РО по вводу доходов"
+' Приёмник:         "РО по вводу доходов итог выборк" — вставка С A1 (с шапкой)
+'
+' Якоря/настройки на листе настроек:
+' - Блок режимов/кол-в: якорь "Настройки выборки >>>" строго в колонке E
+'     * "Отбирать топовых по"
+'     * "Кол-во топовых проводок"
+'     * "Кол-во рандомных проводок"
+' - SEED: якорь "Выборка для тестирования (в рублях) >>>" строго в колонке B,
+'         целевая ячейка = AnchorRow + 2 (вниз) и +1 столбец (вправо) => колонка C
+' - УТ (тыс. руб.): I5
+'
+' Поведение по SEED:
+' - Если ячейка сида ПУСТА — генерируем seed и можем перебирать seed+1 до MAX_RESEED_ATTEMPTS
+'   (для уменьшения «мелочи»). После — записываем фактически использованный seed.
+' - Если в ячейке seed уже есть — используем его БЕЗ изменения и переборов.
+'
+' Изменения в 1.6.8:
+' - Добавлена проверка вместимости: если (топ + рандом) > кол-ва кандидатов,
+'   показываем MsgBox и выходим, не внося изменений.
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.6.8"
+Private currentStep As String
+
+
+' ---- Листы ----
+Private Const SRC_SHEET As String = "РО по вводу доходов попул 3л"
+Private Const DST_SHEET As String = "РО по вводу доходов итог выборк"
+Private Const SETTINGS_SHEET As String = "10. РО по вводу доходов"
+
+
+' ---- Настройки / якоря ----
+Private Const ANCHOR_TEXT As String = "Настройки выборки >>>" ' строго в колонке E
+Private Const LABEL_TOP_MODE As String = "Отбирать топовых по"
+Private Const LABEL_TOP_COUNT As String = "Кол-во топовых проводок"
+Private Const LABEL_RAND_COUNT As String = "Кол-во рандомных проводок"
+
+
+' SEED по якорю во 2-й колонке (B): целевая ячейка = AnchorRow+2, Col = 2+1 (C)
+Private Const SEED_ANCHOR_TEXT As String = "Выборка для тестирования (в рублях) >>>"
+Private Const SEED_ANCHOR_COL  As Long = 2   ' B
+Private Const SEED_ROW_OFFS    As Long = 2   ' вниз
+Private Const SEED_COL_OFFS    As Long = 1   ' вправо (C)
+
+
+' Уровень точности (тыс. руб.)
+Private Const UT_ADDR As String = "I5"
+
+
+' ---- Поля шапки ----
+Private Const H_SUM As String = "Сумма"
+Private Const H_DT  As String = "Счет Дт"
+Private Const H_KT  As String = "Счет Кт"
+
+
+' ---- Режимы (без Enum) ----
+Private Const TM_COUNT As Long = 0
+Private Const TM_UT    As Long = 1
+
+
+' ---- Порог «мелочи» и лимит перебора ----
+Private Const MIN_ABS_AMOUNT_RUB As Double = 1000#
+Private Const MAX_RESEED_ATTEMPTS As Long = 50
+
+
+' ---------------- ЛОГ-СИСТЕМА ----------------
+Private Sub LogWrite(ByVal msg As String)
+    Dim ws As Worksheet, r As Long
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("Логи")
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = "Логи"
+        ws.Range("A1:D1").Value = Array("Дата/Время", "Этап", "Версия", "Сообщение")
+    End If
+    With ws
+        r = .Cells(.rows.count, 1).End(xlUp).Row + 1
+        .Cells(r, 1).Value = Now
+        .Cells(r, 2).Value = IIf(LenB(currentStep) > 0, currentStep, "-")
+        .Cells(r, 3).Value = "Rnd_RO_Vvod v" & MacroVersion
+        .Cells(r, 4).Value = msg
+    End With
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    LogWrite "Начало"
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite "Завершено"
+End Sub
+
+
+' ---------------- УТИЛИТЫ ----------------
+Private Function SheetOrNothing(ByVal name As String) As Worksheet
+    On Error Resume Next
+    Set SheetOrNothing = ThisWorkbook.Worksheets(name)
+    On Error GoTo 0
+End Function
+
+
+' Найти якорь "Настройки выборки >>>" строго в КОЛОНКЕ E
+Private Function FindAnchorRowInColE(ws As Worksheet) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Columns(5).Find(What:=ANCHOR_TEXT, After:=ws.Cells(ws.rows.count, 5), _
+                                LookIn:=xlValues, LookAt:=xlWhole, SearchOrder:=xlByRows, _
+                                SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+    If Not c Is Nothing Then
+        FindAnchorRowInColE = c.Row
+        LogWrite "Якорь найден: " & ANCHOR_TEXT & " в " & c.Address(0, 0)
+    Else
+        FindAnchorRowInColE = 0
+        LogWrite "Якорь '" & ANCHOR_TEXT & "' в колонке E не найден."
+    End If
+End Function
+
+
+' Поиск якоря в заданной колонке
+Private Function FindAnchorRowInColumn(ws As Worksheet, ByVal col As Long, ByVal anchorText As String) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Columns(col).Find(What:=anchorText, After:=ws.Cells(ws.rows.count, col), _
+                                 LookIn:=xlValues, LookAt:=xlWhole, SearchOrder:=xlByRows, _
+                                 SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+    If Not c Is Nothing Then
+        FindAnchorRowInColumn = c.Row
+        LogWrite "Якорь найден: " & anchorText & " в " & c.Address(0, 0)
+    Else
+        FindAnchorRowInColumn = 0
+        LogWrite "Якорь '" & anchorText & "' в колонке " & col & " не найден."
+    End If
+End Function
+
+
+' В колонке E под якорем ищем текст labelText, значение берём из колонки F этой же строки
+Private Function ReadSettingBelowAnchor(ws As Worksheet, ByVal anchorRow As Long, ByVal labelText As String, _
+                                        ByRef valueCell As Range, Optional ByVal maxRows As Long = 120) As Boolean
+    Dim rng As Range, c As Range
+    If anchorRow <= 0 Then Exit Function
+    On Error Resume Next
+    Set rng = ws.Range(ws.Cells(anchorRow + 1, 5), ws.Cells(anchorRow + maxRows, 5))
+    If Not rng Is Nothing Then
+        Set c = rng.Find(What:=labelText, After:=rng.Cells(rng.Cells.count), _
+                         LookIn:=xlValues, LookAt:=xlWhole, SearchOrder:=xlByRows, _
+                         SearchDirection:=xlNext, MatchCase:=False)
+    End If
+    On Error GoTo 0
+    If c Is Nothing Then
+        ReadSettingBelowAnchor = False
+    Else
+        Set valueCell = c.Offset(0, 1) ' колонка F
+        ReadSettingBelowAnchor = True
+        LogWrite "Настройка '" & labelText & "' найдена: " & c.Address(0, 0) & " -> Значение: " & valueCell.Address(0, 0)
+    End If
+End Function
+
+
+Private Function NormalizeStr(v As Variant) As String
+    NormalizeStr = LCase$(Trim$(CStr(v)))
+End Function
+
+
+Private Function MinLng(a As Long, b As Long) As Long
+    If a < b Then MinLng = a Else MinLng = b
+End Function
+
+
+' Быстрая сортировка индексов по ключу-числу (DESC)
+Private Function BuildOrderByAmtDesc(ByRef amt() As Double, ByVal n As Long) As Variant
+    Dim idx() As Long, i As Long
+    ReDim idx(1 To n)
+    For i = 1 To n: idx(i) = i: Next i
+    QuickSortIdxDesc idx, amt, 1, n
+    BuildOrderByAmtDesc = idx
+End Function
+
+
+Private Sub QuickSortIdxDesc(ByRef idx() As Long, ByRef key() As Double, ByVal first As Long, ByVal last As Long)
+    Dim i As Long, j As Long, p As Double, t As Long
+    i = first: j = last
+    p = key(idx((first + last) \ 2))
+    Do While i <= j
+        Do While key(idx(i)) > p: i = i + 1: Loop
+        Do While key(idx(j)) < p: j = j - 1: Loop
+        If i <= j Then
+            t = idx(i): idx(i) = idx(j): idx(j) = t
+            i = i + 1: j = j - 1
+        End If
+    Loop
+    If first < j Then QuickSortIdxDesc idx, key, first, j
+    If i < last Then QuickSortIdxDesc idx, key, i, last
+End Sub
+
+
+' Посчитать, сколько строк в наборе имеют Abs([Сумма]) < threshold
+Private Function CountSmallInSet(ByRef rowsIdx() As Long, ByVal cnt As Long, _
+                                 ByRef src As Variant, ByVal cSum As Long, _
+                                 ByVal thresholdRub As Double, _
+                                 Optional ByVal logPrefix As String = "") As Long
+    Dim i As Long, srcRow As Long, v As Variant, small As Long
+    Dim show As Long, msg As String
+    small = 0: show = 0
+    For i = 1 To cnt
+        srcRow = rowsIdx(i)
+        v = src(srcRow, cSum)
+        If Not IsError(v) And IsNumeric(v) Then
+            If Abs(CDbl(v)) < thresholdRub Then
+                small = small + 1
+                If show < 10 Then
+                    show = show + 1
+                    msg = msg & IIf(Len(msg) > 0, "; ", "") & "#" & i & ":R" & srcRow & "=" & CDbl(v)
+                End If
+            End If
+        End If
+    Next i
+    If small > 0 Then
+        LogWrite IIf(Len(logPrefix) > 0, logPrefix & " ", "") & "мелких=" & small & " (< " & thresholdRub & " руб). Примеры: " & msg
+    End If
+    CountSmallInSet = small
+End Function
+
+
+' --- Определение режима отбора топовых (без Enum) ---
+Private Function DetectTopMode(ByVal rawMode As String) As Long
+    Dim ms As String
+    Dim hasOstat As Boolean, hasUT As Boolean, hasGT As Boolean, hasPorog As Boolean, hasThreshold As Boolean
+    Dim desc As String
+
+
+    ms = NormalizeStr(rawMode)
+    hasOstat = (InStr(ms, "остат") > 0)
+    hasUT = (InStr(ms, "ут") > 0)
+    hasGT = (InStr(ms, ">") > 0 Or InStr(ms, "больше") > 0 Or InStr(ms, "выше") > 0 Or InStr(ms, "greater") > 0 Or InStr(ms, ">=") > 0)
+    hasPorog = (InStr(ms, "порог") > 0)
+    hasThreshold = (InStr(ms, "threshold") > 0)
+
+
+    If hasOstat Or hasPorog Or hasThreshold Or (hasUT And hasGT) Then
+        DetectTopMode = TM_UT
+        desc = "распознано: ПО ОСТАТКУ (>УТ)"
+    Else
+        DetectTopMode = TM_COUNT
+        desc = "распознано: ПО КОЛИЧЕСТВУ"
+    End If
+
+
+    LogWrite "Распознавание режима: raw='" & rawMode & "', norm='" & ms & _
+             "'; flags[остат=" & hasOstat & ", ут=" & hasUT & ", >=" & hasGT & _
+             ", порог=" & hasPorog & ", threshold=" & hasThreshold & "] -> " & desc
+End Function
+
+
+' ---------------- ОСНОВНОЙ МАКРОС ----------------
+Public Sub Рандом_выборка_РО_по_вводу_доходов()
+    Dim t0 As Double: t0 = Timer
+    On Error GoTo ErrHandler
+
+
+    StartStep "Инициализация"
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    LogWrite "Оптимизации включены"
+    EndStep
+
+
+    Dim wsS As Worksheet, wsD As Worksheet, wsSet As Worksheet
+    Set wsS = SheetOrNothing(SRC_SHEET)
+    Set wsD = SheetOrNothing(DST_SHEET)
+    Set wsSet = SheetOrNothing(SETTINGS_SHEET)
+
+
+    If wsS Is Nothing Then Err.Raise vbObjectError + 1, , "Источник '" & SRC_SHEET & "' не найден"
+    If wsSet Is Nothing Then Err.Raise vbObjectError + 2, , "Лист настроек '" & SETTINGS_SHEET & "' не найден"
+    If wsD Is Nothing Then
+        Set wsD = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        wsD.name = DST_SHEET
+        LogWrite "Создан лист приёмника: '" & DST_SHEET & "'"
+    End If
+
+
+    ' ---------- ЧТЕНИЕ НАСТРОЕК ----------
+    StartStep "Чтение настроек"
+    Dim anchorRow As Long: anchorRow = FindAnchorRowInColE(wsSet)
+    If anchorRow = 0 Then Err.Raise vbObjectError + 101, , "Не найден якорь '" & ANCHOR_TEXT & "' в колонке E листа '" & SETTINGS_SHEET & "'"
+
+
+    Dim vc As Range, ok As Boolean
+    Dim modeStr As String, topCount As Long, randCount As Long
+
+
+    ok = ReadSettingBelowAnchor(wsSet, anchorRow, LABEL_TOP_MODE, vc)
+    If Not ok Then Err.Raise vbObjectError + 102, , "Не найдена настройка '" & LABEL_TOP_MODE & "' под якорем"
+    modeStr = CStr(vc.Value)
+    LogWrite LABEL_TOP_MODE & ": " & modeStr
+
+
+    ok = ReadSettingBelowAnchor(wsSet, anchorRow, LABEL_TOP_COUNT, vc)
+    If ok And IsNumeric(vc.Value) Then
+        topCount = CLng(vc.Value)
+    Else
+        topCount = 0
+    End If
+    LogWrite LABEL_TOP_COUNT & ": " & IIf(ok, CStr(vc.Value), "не найдено/пусто") & " => " & topCount
+
+
+    ok = ReadSettingBelowAnchor(wsSet, anchorRow, LABEL_RAND_COUNT, vc)
+    If Not ok Then Err.Raise vbObjectError + 103, , "Не найдена настройка '" & LABEL_RAND_COUNT & "' под якорем"
+    If IsNumeric(vc.Value) Then randCount = CLng(vc.Value) Else randCount = 0
+    LogWrite LABEL_RAND_COUNT & ": " & CStr(vc.Value)
+
+
+    ' SEED
+    Dim seedAnchorRow As Long, seedCell As Range
+    Dim seed As Long, seedLocked As Boolean
+    seedAnchorRow = FindAnchorRowInColumn(wsSet, SEED_ANCHOR_COL, SEED_ANCHOR_TEXT)
+    If seedAnchorRow = 0 Then Err.Raise vbObjectError + 110, , "Не найден якорь '" & SEED_ANCHOR_TEXT & "' в колонке B листа '" & SETTINGS_SHEET & "'"
+
+
+    Set seedCell = wsSet.Cells(seedAnchorRow + SEED_ROW_OFFS, SEED_ANCHOR_COL + SEED_COL_OFFS)
+    If IsNumeric(seedCell.Value) And CLng(seedCell.Value) > 0 Then
+        seed = CLng(seedCell.Value)
+        seedLocked = True
+        LogWrite "Random seed из якоря (зафиксирован пользователем): " & seed & " (" & seedCell.Address(0, 0) & ")"
+    Else
+        seedLocked = False
+        seed = CLng(Timer * 1000) Mod 1000000
+        If seed <= 0 Then seed = 1
+        seedCell.Value = seed
+        LogWrite "Random seed сгенерирован и записан в " & seedCell.Address(0, 0) & " = " & seed
+    End If
+
+
+    ' УТ
+    Dim utThousands As Double, utRub As Double
+    If Not IsNumeric(wsSet.Range(UT_ADDR).Value) Then Err.Raise vbObjectError + 104, , SETTINGS_SHEET & "!" & UT_ADDR & " не число (УТ, тыс. руб.)"
+    utThousands = CDbl(wsSet.Range(UT_ADDR).Value)
+    utRub = utThousands * 1000#
+    LogWrite "Уровень точности: " & SETTINGS_SHEET & "!" & UT_ADDR & " = " & utThousands & " тыс. => порог " & utRub & " руб."
+    LogWrite "Порог «мелочи» MIN_ABS_AMOUNT_RUB = " & MIN_ABS_AMOUNT_RUB & " руб."
+    EndStep
+
+
+    ' ---------- ЧТЕНИЕ ИСТОЧНИКА ----------
+    StartStep "Чтение источника и шапки"
+    Dim lastRowS As Long, lastColS As Long
+    lastRowS = wsS.Cells(wsS.rows.count, 1).End(xlUp).Row
+    lastColS = wsS.Cells(1, wsS.Columns.count).End(xlToLeft).Column
+    If lastRowS < 2 Then Err.Raise vbObjectError + 105, , "На '" & SRC_SHEET & "' нет данных"
+
+
+    Dim src As Variant
+    src = wsS.Range(wsS.Cells(1, 1), wsS.Cells(lastRowS, lastColS)).Value2
+
+
+    Dim mapH As Object: Set mapH = CreateObject("Scripting.Dictionary")
+    mapH.CompareMode = vbTextCompare
+
+
+    Dim j As Long
+    For j = 1 To lastColS
+        If LenB(src(1, j)) > 0 Then mapH(Trim$(CStr(src(1, j)))) = j
+    Next j
+
+
+    Dim cSum As Long, cDt As Long, cKt As Long
+    cSum = IIf(mapH.Exists(H_SUM), mapH(H_SUM), 0)
+    cDt = IIf(mapH.Exists(H_DT), mapH(H_DT), 0)
+    cKt = IIf(mapH.Exists(H_KT), mapH(H_KT), 0)
+
+
+    LogWrite "Шапка источника: Сумма=" & cSum & "; Счет Дт=" & cDt & "; Счет Кт=" & cKt & "; Колонок=" & lastColS
+    If cSum * cDt * cKt = 0 Then Err.Raise vbObjectError + 106, , "В шапке источника нет 'Сумма'/'Счет Дт'/'Счет Кт'"
+    EndStep
+
+
+    ' ---------- КАНДИДАТЫ ПО 'Сумма' ----------
+    StartStep "Фильтрация кандидатов по 'Сумма'<>0"
+    Dim n As Long, i As Long
+    Dim candIdx() As Long, candAmt() As Double
+    ReDim candIdx(1 To lastRowS - 1)
+    ReDim candAmt(1 To lastRowS - 1)
+
+
+    For i = 2 To lastRowS
+        If Not IsError(src(i, cSum)) And IsNumeric(src(i, cSum)) Then
+            If CDbl(src(i, cSum)) <> 0 Then
+                n = n + 1
+                candIdx(n) = i
+                candAmt(n) = CDbl(src(i, cSum))
+            End If
+        End If
+    Next i
+    If n = 0 Then Err.Raise vbObjectError + 107, , "Нет кандидатов (все 'Сумма' = 0 или нечисловые)"
+    ReDim Preserve candIdx(1 To n)
+    ReDim Preserve candAmt(1 To n)
+    LogWrite "Кандидатов: " & n
+    EndStep
+
+
+    ' ---------- ТОПОВЫЕ ----------
+    StartStep "Выбор топовых"
+    Dim topIdx() As Long, pickedTop As Long
+    Dim mode As Long: mode = DetectTopMode(modeStr)
+
+
+    ' --- Новая проверка вместимости для режима ПО КОЛИЧЕСТВУ ---
+    If mode = TM_COUNT Then
+        If topCount + randCount > n Then
+            LogWrite "Останов: запрос превышает популяцию (n=" & n & ", top=" & topCount & ", rand=" & randCount & ")"
+            MsgBox "Измените настройки: запрошено ТОП=" & topCount & " и РАНДОМ=" & randCount & _
+                   " (всего " & (topCount + randCount) & "), а в популяции найдено только " & n & " кандидатов.", _
+                   vbExclamation, "Недостаточно данных для выборки"
+            GoTo Cleanup
+        End If
+    End If
+
+
+    If mode = TM_UT Then
+        Dim pass As Long
+        ReDim topIdx(1 To n)
+        For i = 1 To n
+            If candAmt(i) > utRub Then pass = pass + 1: topIdx(pass) = candIdx(i)
+        Next i
+        pickedTop = pass
+        If pickedTop > 0 Then ReDim Preserve topIdx(1 To pickedTop)
+        LogWrite "Топ по остатку (> " & utRub & "): " & pickedTop
+        If pickedTop > 30 Then
+            LogWrite "Топовых по остатку больше 30 (" & pickedTop & "). Останов."
+            Err.Raise vbObjectError + 120, , "Проводок с 'Сумма' выше УТ больше 30 (" & pickedTop & "). Измените настройки."
+        End If
+
+
+        ' --- Новая проверка вместимости для режима ПО ОСТАТКУ ---
+        If pickedTop + randCount > n Then
+            LogWrite "Останов: запрос превышает популяцию (n=" & n & ", top(>УТ)=" & pickedTop & ", rand=" & randCount & ")"
+            MsgBox "Измените настройки: ТОП по остатку=" & pickedTop & " + РАНДОМ=" & randCount & _
+                   " (всего " & (pickedTop + randCount) & "), а в популяции найдено только " & n & " кандидатов.", _
+                   vbExclamation, "Недостаточно данных для выборки"
+            GoTo Cleanup
+        End If
+    Else
+        If CLng(topCount) > 0 Then
+            Dim order As Variant: order = BuildOrderByAmtDesc(candAmt, n)
+            Dim takeN As Long: takeN = MinLng(topCount, n)
+            ReDim topIdx(1 To takeN)
+            Dim k As Long
+            For k = 1 To takeN
+                topIdx(k) = candIdx(order(k))
+            Next k
+            pickedTop = takeN
+        End If
+        LogWrite "Топ по количеству: " & pickedTop & " из " & topCount
+    End If
+
+
+    If pickedTop > 0 Then
+        Dim smallTop As Long
+        smallTop = CountSmallInSet(topIdx, pickedTop, src, cSum, MIN_ABS_AMOUNT_RUB, "Топ")
+        If smallTop > 0 Then
+            LogWrite "ВНИМАНИЕ: в топовой части есть " & smallTop & " строк < " & MIN_ABS_AMOUNT_RUB & _
+                     " руб. Пере-рандомизация на них не влияет."
+        End If
+    End If
+    EndStep
+
+
+    ' ---------- ПУЛ ДЛЯ РАНДОМА ----------
+    StartStep "Формирование пула для рандома"
+    Dim inTop As Object: Set inTop = CreateObject("Scripting.Dictionary")
+    If pickedTop > 0 Then
+        Dim t As Long
+        For t = 1 To pickedTop: inTop(topIdx(t)) = True: Next t
+    End If
+
+
+    Dim pool() As Long, poolCount As Long
+    ReDim pool(1 To n)
+    For i = 1 To n
+        If Not inTop.Exists(candIdx(i)) Then
+            poolCount = poolCount + 1
+            pool(poolCount) = candIdx(i)
+        End If
+    Next i
+    If poolCount > 0 Then ReDim Preserve pool(1 To poolCount) Else Erase pool
+    LogWrite "Пул для рандома: " & poolCount
+    EndStep
+
+
+    ' ---------- РАНДОМ + КОНТРОЛЬ «МЕЛОЧИ» ----------
+    StartStep "Рандом + контроль «мелочи»"
+    Dim randIdx() As Long, pickedRand As Long
+    Dim finalSeed As Long: finalSeed = seed
+    Dim attempts As Long: attempts = 0
+
+
+    pickedRand = 0
+    If randCount > 0 And poolCount > 0 Then
+        ' подготовим список "крупных" (>= MIN_ABS_AMOUNT_RUB)
+        Dim poolQual() As Long, pq As Long, srcRow As Long, v As Variant
+        ReDim poolQual(1 To poolCount)
+        For i = 1 To poolCount
+            srcRow = pool(i): v = src(srcRow, cSum)
+            If Not IsError(v) And IsNumeric(v) Then
+                If Abs(CDbl(v)) >= MIN_ABS_AMOUNT_RUB Then pq = pq + 1: poolQual(pq) = pool(i)
+            End If
+        Next i
+        If pq > 0 Then ReDim Preserve poolQual(1 To pq)
+
+
+        If seedLocked Then
+            ' --- Пользовательский seed: без переборов и без изменений seed ---
+            If pq >= randCount Then
+                randIdx = RC_RandPick(poolQual, randCount, finalSeed)
+                pickedRand = UBound(randIdx)
+                LogWrite "Рандом (seed пользователя) только из 'крупных': " & pickedRand & " из " & randCount
+            Else
+                Dim takeQ As Long: takeQ = pq
+                Dim pickedQ() As Long
+                If takeQ > 0 Then pickedQ = RC_RandPick(poolQual, takeQ, finalSeed)
+
+
+                Dim restPool() As Long, rp As Long, used As Object
+                Set used = CreateObject("Scripting.Dictionary")
+                If takeQ > 0 Then For i = 1 To takeQ: used(pickedQ(i)) = True: Next i
+                ReDim restPool(1 To poolCount - takeQ)
+                rp = 0
+                For i = 1 To poolCount
+                    If Not used.Exists(pool(i)) Then rp = rp + 1: restPool(rp) = pool(i)
+                Next i
+                If rp > 0 Then ReDim Preserve restPool(1 To rp)
+
+
+                Dim needRest As Long: needRest = randCount - takeQ
+                Dim pickedRest() As Long
+                If needRest > 0 And rp > 0 Then pickedRest = RC_RandPick(restPool, needRest, finalSeed)
+
+
+                ReDim randIdx(1 To randCount)
+                Dim p As Long: p = 0
+                If takeQ > 0 Then For i = 1 To takeQ: p = p + 1: randIdx(p) = pickedQ(i): Next i
+                If needRest > 0 Then For i = 1 To needRest: p = p + 1: randIdx(p) = pickedRest(i): Next i
+                pickedRand = randCount
+
+
+                LogWrite "Рандом (seed пользователя): крупные=" & takeQ & ", добор из общего пула=" & needRest
+            End If
+
+
+            Dim smallLocked As Long
+            smallLocked = CountSmallInSet(randIdx, pickedRand, src, cSum, MIN_ABS_AMOUNT_RUB, "Итог/Рандом")
+            LogWrite "Итог: мелочь в рандомной части (seed пользователя) = " & smallLocked
+
+
+        Else
+            ' --- Автосгенерированный seed: допускается перебор seed+k ---
+            Dim smallRand As Long
+            Do
+                attempts = attempts + 1
+                If pq >= randCount Then
+                    randIdx = RC_RandPick(poolQual, randCount, seed + (attempts - 1))
+                Else
+                    randIdx = RC_RandPick(pool, randCount, seed + (attempts - 1))
+                End If
+                pickedRand = IIf((Not Not randIdx) <> 0, UBound(randIdx), 0)
+                smallRand = CountSmallInSet(randIdx, pickedRand, src, cSum, MIN_ABS_AMOUNT_RUB, "Рандом attempt#" & attempts)
+                If smallRand = 0 Then
+                    finalSeed = seed + (attempts - 1)
+                    Exit Do
+                End If
+                If attempts >= MAX_RESEED_ATTEMPTS Then Exit Do
+            Loop
+
+
+            If smallRand > 0 And pq > 0 And pq < randCount Then
+                Dim takeQ2 As Long: takeQ2 = pq
+                Dim pickedQ2() As Long
+                pickedQ2 = RC_RandPick(poolQual, takeQ2, seed + attempts)
+
+
+                Dim used2 As Object: Set used2 = CreateObject("Scripting.Dictionary")
+                For i = 1 To takeQ2: used2(pickedQ2(i)) = True: Next i
+
+
+                Dim restPool2() As Long, rp2 As Long
+                ReDim restPool2(1 To poolCount - takeQ2)
+                rp2 = 0
+                For i = 1 To poolCount
+                    If Not used2.Exists(pool(i)) Then rp2 = rp2 + 1: restPool2(rp2) = pool(i)
+                Next i
+                If rp2 > 0 Then ReDim Preserve restPool2(1 To rp2)
+
+
+                Dim needRest2 As Long: needRest2 = randCount - takeQ2
+                Dim pickedRest2() As Long
+                If needRest2 > 0 And rp2 > 0 Then pickedRest2 = RC_RandPick(restPool2, needRest2, seed + attempts)
+
+
+                ReDim randIdx(1 To randCount)
+                Dim p2 As Long: p2 = 0
+                For i = 1 To takeQ2: p2 = p2 + 1: randIdx(p2) = pickedQ2(i): Next i
+                For i = 1 To needRest2: p2 = p2 + 1: randIdx(p2) = pickedRest2(i): Next i
+                pickedRand = randCount
+                finalSeed = seed + (attempts - 1)
+                LogWrite "Недостаточно 'крупных': добор из общего пула. Попыток=" & attempts & "; final seed=" & finalSeed
+            ElseIf smallRand = 0 Then
+                LogWrite "Рандом без «мелочи» достигнут за " & attempts & " попыток; final seed=" & finalSeed
+            Else
+                LogWrite "После " & attempts & " попыток мелочь остаётся. Принят final seed=" & (seed + (attempts - 1))
+            End If
+        End If
+    End If
+    EndStep
+
+
+    ' ---------- ИТОГОВЫЙ НАБОР И ВЫГРУЗКА ----------
+    StartStep "Формирование массива вывода"
+    Dim totalOut As Long: totalOut = pickedTop + pickedRand
+    If totalOut = 0 Then
+        LogWrite "Нет строк для вывода — завершаем."
+        GoTo Cleanup
+    End If
+
+
+    Dim outRows() As Long, pAll As Long
+    ReDim outRows(1 To totalOut): pAll = 0
+    If pickedTop > 0 Then For i = 1 To pickedTop: pAll = pAll + 1: outRows(pAll) = topIdx(i): Next i
+    If pickedRand > 0 Then For i = 1 To pickedRand: pAll = pAll + 1: outRows(pAll) = randIdx(i): Next i
+
+
+    If pickedRand > 0 Then
+        Dim smallFinalRand As Long
+        smallFinalRand = CountSmallInSet(randIdx, pickedRand, src, cSum, MIN_ABS_AMOUNT_RUB, "Итог/Рандом")
+        LogWrite "Итог: мелочь в рандомной части = " & smallFinalRand
+    End If
+    EndStep
+
+
+    StartStep "Очистка и выгрузка на '" & DST_SHEET & "' с A1"
+    With wsD
+        .Cells.Clear
+        Dim outArr As Variant
+        outArr = BuildOutputArray(src, outRows, totalOut, lastColS)
+        .Range("A1").Resize(totalOut + 1, lastColS).Value = outArr
+        LogWrite "Записано: диапазон A1:" & Split(.Range("A1").Resize(totalOut + 1, lastColS).Address(0, 0), ":")(1) & _
+                 " (rows=" & (totalOut + 1) & ", cols=" & lastColS & ")"
+
+
+        ' Счета как текст + перезапись .Text
+        If mapH.Exists(H_DT) Then .Columns(mapH(H_DT)).NumberFormat = "@"
+        If mapH.Exists(H_KT) Then .Columns(mapH(H_KT)).NumberFormat = "@"
+        If mapH.Exists(H_DT) Or mapH.Exists(H_KT) Then
+            Dim r As Long, srcRow2 As Long
+            For r = 1 To totalOut
+                srcRow2 = outRows(r)
+                If mapH.Exists(H_DT) Then .Cells(r + 1, mapH(H_DT)).Value = wsS.Cells(srcRow2, cDt).Text
+                If mapH.Exists(H_KT) Then .Cells(r + 1, mapH(H_KT)).Value = wsS.Cells(srcRow2, cKt).Text
+            Next r
+        End If
+
+
+        .Columns.AutoFit
+    End With
+    EndStep
+
+
+    ' --- Итог по seed ---
+    If seedLocked Then
+        LogWrite "Seed пользователем зафиксирован: " & seed & " (без изменений)"
+    Else
+        If finalSeed <> seed Then
+            seedCell.Value = finalSeed
+            LogWrite "Seed обновлён на фактически использованный: " & finalSeed & " (было " & seed & ")"
+        Else
+            LogWrite "Seed не менялся: " & seed
+        End If
+    End If
+
+
+    LogWrite "Готово: топ=" & pickedTop & ", рандом=" & pickedRand & ", всего=" & totalOut & _
+             "; колонок=" & lastColS & "; время=" & Format$(Timer - t0, "0.00") & " c"
+
+
+Cleanup:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Exit Sub
+
+
+ErrHandler:
+    LogWrite "Ошибка на этапе '" & currentStep & "': " & Err.Description & " (№" & Err.Number & ")"
+    Resume Cleanup
+End Sub
+
+
+' ---------- ВСПОМОГАТЕЛЬНАЯ СБОРКА ВЫХОДНОГО МАССИВА ----------
+Private Function BuildOutputArray(ByRef src As Variant, ByRef outRows() As Long, _
+                                  ByVal totalOut As Long, ByVal lastColS As Long) As Variant
+    Dim outArr As Variant
+    ReDim outArr(1 To totalOut + 1, 1 To lastColS)
+
+
+    Dim j As Long
+    For j = 1 To lastColS
+        outArr(1, j) = src(1, j)
+    Next j
+
+
+    Dim r As Long, c As Long, srcRow As Long
+    For r = 1 To totalOut
+        srcRow = outRows(r)
+        For c = 1 To lastColS
+            outArr(r + 1, c) = src(srcRow, c)
+        Next c
+    Next r
+
+
+    BuildOutputArray = outArr
+End Function

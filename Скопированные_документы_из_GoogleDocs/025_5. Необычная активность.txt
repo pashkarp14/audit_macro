@@ -1,0 +1,511 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modTopActivity
+' Макрос:    Заполнить_Топ_Активность
+' Версия:    1.2.1  (17.09.2025)
+'
+' Что нового vs 1.2.0:
+'   - Рамка ставится ТОЛЬКО вокруг вставленных данных (без строки шапки).
+'   - Логирует адрес диапазона данных для рамки (без шапки).
+'
+' Назначение:
+'   Найти на "По счету" два блока (Дт/Кт), взять ТОП-10 по "Количество" и
+'   вставить под якорями на "5. Необычная активность" с сохранением форматов.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.2.1"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' ---------------------------- ПУБЛИЧНЫЙ МАКРОС --------------------------------
+Public Sub Заполнить_Топ_Активность()
+    Dim t0 As Double: t0 = Timer
+    Call LogWrite("Старт Заполнить_Топ_Активность v" & MODULE_VERSION)
+    
+    Dim appCalc As XlCalculation
+    Dim scrUpd As Boolean, ev As Boolean, disp As Boolean
+    
+    On Error GoTo ErrHandler
+    appCalc = Application.Calculation
+    scrUpd = Application.ScreenUpdating
+    ev = Application.EnableEvents
+    disp = Application.DisplayAlerts
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    
+    Dim wsSrc As Worksheet, wsDst As Worksheet
+    Set wsSrc = GetSheetByName("По счету")
+    Set wsDst = GetSheetByName("5. Необычная активность")
+    If wsSrc Is Nothing Then
+        Call LogWrite("ОШИБКА: Не найден лист 'По счету'. Завершение.")
+        GoTo FinallyExit
+    End If
+    If wsDst Is Nothing Then
+        Call LogWrite("ОШИБКА: Не найден лист '5. Необычная активность'. Завершение.")
+        GoTo FinallyExit
+    End If
+    
+    ' --- ДЕБЕТ ---
+    Call ProcessTopBlock( _
+        wsSrc, 2, "Свод проводок дебет>>>", _
+        "Счет Дт", "Количество", _
+        wsDst, 2, "Топ активность дебет>>>", 10)
+    
+    ' --- КРЕДИТ ---
+    Call ProcessTopBlock( _
+        wsSrc, 5, "Свод проводок кредит>>>", _
+        "Счет Кт", "Количество", _
+        wsDst, 5, "Топ активность кредит>>>", 10)
+    
+FinallyExit:
+    Application.ScreenUpdating = scrUpd
+    Application.EnableEvents = ev
+    Application.DisplayAlerts = disp
+    Application.Calculation = appCalc
+    
+    Call LogWrite("Финиш Заполнить_Топ_Активность v" & MODULE_VERSION & "; Время, сек: " & Format$(Timer - t0, "0.000"))
+    Exit Sub
+
+
+ErrHandler:
+    Call LogWrite("ОШИБКА (главный): " & Err.Number & " — " & Err.Description)
+    Resume FinallyExit
+End Sub
+
+
+' ---------------------------- ОСНОВНОЙ БЛОК -----------------------------------
+Private Sub ProcessTopBlock( _
+    ByVal wsSrc As Worksheet, _
+    ByVal anchorColSrc As Long, _
+    ByVal anchorTextSrc As String, _
+    ByVal headerNameAcct As String, _
+    ByVal headerNameQty As String, _
+    ByVal wsDst As Worksheet, _
+    ByVal anchorColDst As Long, _
+    ByVal anchorTextDst As String, _
+    ByVal topN As Long)
+    
+    On Error GoTo ErrHandler
+    Dim stepTag As String: stepTag = "INIT"
+    
+    Call LogWrite("== Блок: " & anchorTextSrc & " | Источник: '" & wsSrc.Name & "' Колонка=" & anchorColSrc)
+    
+    Dim anchorSrc As Range
+    Set anchorSrc = FindInColumn(wsSrc, anchorColSrc, anchorTextSrc)
+    If anchorSrc Is Nothing Then
+        Call LogWrite("Предупреждение: якорь '" & anchorTextSrc & "' не найден. Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim hdrRow As Long, hdrCol As Long
+    hdrRow = anchorSrc.Row + 1
+    hdrCol = anchorColSrc
+    
+    Dim h1 As String, h2 As String
+    h1 = CStr(wsSrc.Cells(hdrRow, hdrCol).Value)
+    h2 = CStr(wsSrc.Cells(hdrRow, hdrCol + 1).Value)
+    Call LogWrite("Найдена шапка: [" & h1 & "] | [" & h2 & "]")
+    If Trim$(LCase$(h1)) <> Trim$(LCase$(headerNameAcct)) Then
+        Call LogWrite("ВНИМАНИЕ: ожидали '" & headerNameAcct & "', но нашли '" & h1 & "'")
+    End If
+    If Trim$(LCase$(h2)) <> Trim$(LCase$(headerNameQty)) Then
+        Call LogWrite("ВНИМАНИЕ: ожидали '" & headerNameQty & "', но нашли '" & h2 & "'")
+    End If
+    
+    stepTag = "FIND_TOTAL"
+    Dim totalCell As Range
+    Set totalCell = FindInRange(wsSrc, hdrRow + 1, anchorColSrc, wsSrc.Rows.Count, anchorColSrc, "Итого")
+    If totalCell Is Nothing Then
+        Call LogWrite("ОШИБКА: нижняя граница 'Итого' не найдена под шапкой. Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim totalRow As Long
+    totalRow = IIf(totalCell.MergeCells, totalCell.MergeArea.Row, totalCell.Row)
+    
+    Dim firstDataRow As Long, lastDataRow As Long
+    firstDataRow = hdrRow + 1
+    lastDataRow = totalRow - 1
+    
+    If lastDataRow < firstDataRow Then
+        Call LogWrite("Предупреждение: нет данных между шапкой и 'Итого'. Пропуск блока.")
+        Exit Sub
+    End If
+    
+    ' ---------- Быстрый путь через массив ----------
+    stepTag = "READ_VALUE2"
+    Dim rngData As Range
+    Set rngData = wsSrc.Range(wsSrc.Cells(firstDataRow, hdrCol), wsSrc.Cells(lastDataRow, hdrCol + 1))
+    
+    Dim srcData As Variant
+    srcData = rngData.Value2
+    
+    Dim nRows As Long, nCols As Long
+    Call Get2DSize(srcData, nRows, nCols)
+    If nRows <= 0 Or nCols < 2 Then
+        Call LogWrite("ВНИМАНИЕ: необычный размер массива Value2 (nRows=" & nRows & "; nCols=" & nCols & "). Переход к fallback.")
+        GoTo FallbackScan
+    End If
+    
+    Call LogWrite("Диапазон данных: строк=" & nRows & " (" & firstDataRow & "…" & lastDataRow & "), колонки=" & hdrCol & "…" & (hdrCol + 1))
+    Call LogWrite("Bounds(srcData): L1=" & LBound(srcData, 1) & "; U1=" & UBound(srcData, 1) & "; L2=" & LBound(srcData, 2) & "; U2=" & UBound(srcData, 2))
+    
+    stepTag = "TOPN_ARRAY"
+    Dim eff As Long, i As Long, iRow As Long
+    Dim topCnt() As Double, topIdx() As Long
+    ReDim topCnt(1 To topN)
+    ReDim topIdx(1 To topN)
+    For i = 1 To topN
+        topCnt(i) = -1
+        topIdx(i) = -1
+    Next i
+    
+    Dim cnt As Double, iMin As Long
+    For iRow = 1 To nRows
+        cnt = ToNumeric(srcData(iRow, 2))
+        If cnt >= 0 Then
+            iMin = IndexOfMin(topCnt)
+            If cnt > topCnt(iMin) Then
+                topCnt(iMin) = cnt
+                topIdx(iMin) = iRow
+            End If
+        End If
+        If (iRow Mod 50000) = 0 Then
+            Call LogWrite("...скан=" & iRow & "; curMin=" & Format$(IndexMinValue(topCnt), "0.###"))
+        End If
+    Next iRow
+    
+    eff = 0
+    For i = 1 To topN
+        If topIdx(i) > 0 Then eff = eff + 1
+    Next i
+    If eff = 0 Then
+        Call LogWrite("Предупреждение: подходящих строк не найдено (array). Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim arrIdx() As Long, arrCnt() As Double
+    ReDim arrIdx(1 To eff)
+    ReDim arrCnt(1 To eff)
+    Dim k As Long: k = 0
+    For i = 1 To topN
+        If topIdx(i) > 0 Then
+            k = k + 1
+            arrIdx(k) = topIdx(i) ' индекс внутри srcData
+            arrCnt(k) = topCnt(i)
+        End If
+    Next i
+    
+    Call LogWrite("PRE-ORDER: eff=" & eff & "; arr LBound=" & LBound(arrIdx) & "/" & LBound(arrCnt) & "; UBound=" & UBound(arrIdx) & "/" & UBound(arrCnt))
+    
+    stepTag = "ORDER_DESC"
+    Dim order() As Long
+    order = MakeOrderDesc(arrCnt)
+    
+    Dim logMsg As String
+    logMsg = "ТОП-" & eff & " (array/order): "
+    For i = 1 To eff
+        logMsg = logMsg & "[" & CStr(srcData(arrIdx(order(i)), 1)) & "=" & CStr(arrCnt(order(i))) & "] "
+        If i >= 10 Then Exit For
+    Next i
+    Call LogWrite(logMsg)
+    
+    ' ---------- Вставка на приёмник ----------
+    stepTag = "PASTE_DST"
+    Dim anchorDst As Range
+    Set anchorDst = FindInColumn(wsDst, anchorColDst, anchorTextDst)
+    If anchorDst Is Nothing Then
+        Call LogWrite("ОШИБКА: на приёмнике '" & wsDst.Name & "' не найден якорь '" & anchorTextDst & "'. Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim dstHdrRow As Long: dstHdrRow = anchorDst.Row + 1
+    Dim dstFirstDataRow As Long: dstFirstDataRow = dstHdrRow + 1
+    
+    ' Шапка
+    wsSrc.Range(wsSrc.Cells(hdrRow, hdrCol), wsSrc.Cells(hdrRow, hdrCol + 1)).Copy _
+        Destination:=wsDst.Cells(dstHdrRow, anchorColDst)
+    
+    ' Данные по порядку order()
+    Dim srcR As Long
+    For i = 1 To eff
+        srcR = firstDataRow + arrIdx(order(i)) - 1
+        wsSrc.Range(wsSrc.Cells(srcR, hdrCol), wsSrc.Cells(srcR, hdrCol + 1)).Copy _
+            Destination:=wsDst.Cells(dstFirstDataRow + i - 1, anchorColDst)
+    Next i
+    Application.CutCopyMode = False
+    
+    ' --------- Рамка ТОЛЬКО вокруг данных (без шапки) ----------
+    Dim rngBorderData As Range
+    Set rngBorderData = wsDst.Range( _
+        wsDst.Cells(dstFirstDataRow, anchorColDst), _
+        wsDst.Cells(dstFirstDataRow + eff - 1, anchorColDst + 1))
+    Call ThickOuterBorder(rngBorderData)
+    Call LogWrite("Рамка данных (без шапки): " & rngBorderData.Address(False, False))
+    
+    Call LogWrite("Блок '" & anchorTextDst & "' готов (array/order): вставлено строк=" & eff & _
+                  "; DataRange=" & rngBorderData.Address(False, False))
+    Exit Sub
+
+
+' ----------------------------- FALLBACK ---------------------------------------
+FallbackScan:
+    stepTag = "FALLBACK_SCAN"
+    Call LogWrite("Fallback: прямой проход по ячейкам (" & firstDataRow & "…" & lastDataRow & ")")
+    
+    Dim topCnt2() As Double, topRow2() As Long
+    ReDim topCnt2(1 To topN)
+    ReDim topRow2(1 To topN)
+    Dim i As Long
+    For i = 1 To topN
+        topCnt2(i) = -1
+        topRow2(i) = -1
+    Next i
+    
+    Dim r As Long, iMin2 As Long, eff2 As Long, k2 As Long
+    For r = firstDataRow To lastDataRow
+        Dim c2 As Double
+        c2 = ToNumeric(wsSrc.Cells(r, hdrCol + 1).Value2)
+        If c2 >= 0 Then
+            iMin2 = IndexOfMin(topCnt2)
+            If c2 > topCnt2(iMin2) Then
+                topCnt2(iMin2) = c2
+                topRow2(iMin2) = r
+            End If
+        End If
+        If ((r - firstDataRow + 1) Mod 50000) = 0 Then
+            Call LogWrite("...скан=" & (r - firstDataRow + 1) & "; curMin=" & Format$(IndexMinValue(topCnt2), "0.###"))
+        End If
+    Next r
+    
+    eff2 = 0
+    For i = 1 To topN
+        If topRow2(i) > 0 Then eff2 = eff2 + 1
+    Next i
+    If eff2 = 0 Then
+        Call LogWrite("Предупреждение: подходящих строк нет (fallback). Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim arrIdx2() As Long, arrCnt2() As Double
+    ReDim arrIdx2(1 To eff2)
+    ReDim arrCnt2(1 To eff2)
+    k2 = 0
+    For i = 1 To topN
+        If topRow2(i) > 0 Then
+            k2 = k2 + 1
+            arrIdx2(k2) = topRow2(i) - firstDataRow + 1
+            arrCnt2(k2) = topCnt2(i)
+        End If
+    Next i
+    
+    Call LogWrite("PRE-ORDER (fallback): eff=" & eff2 & "; arr LBound=" & LBound(arrIdx2) & "/" & LBound(arrCnt2) & "; UBound=" & UBound(arrIdx2) & "/" & UBound(arrCnt2))
+    
+    stepTag = "ORDER_DESC_FALLBACK"
+    Dim order2() As Long
+    order2 = MakeOrderDesc(arrCnt2)
+    
+    Dim logMsg2 As String
+    logMsg2 = "ТОП-" & eff2 & " (fallback/order): "
+    For i = 1 To eff2
+        logMsg2 = logMsg2 & "[" & CStr(wsSrc.Cells(firstDataRow + arrIdx2(order2(i)) - 1, hdrCol).Value) & "=" & CStr(arrCnt2(order2(i))) & "] "
+        If i >= 10 Then Exit For
+    Next i
+    Call LogWrite(logMsg2)
+    
+    Dim anchorDst2 As Range
+    Set anchorDst2 = FindInColumn(wsDst, anchorColDst, anchorTextDst)
+    If anchorDst2 Is Nothing Then
+        Call LogWrite("ОШИБКА: на приёмнике '" & wsDst.Name & "' не найден якорь '" & anchorTextDst & "'. Пропуск блока.")
+        Exit Sub
+    End If
+    
+    Dim dstHdrRow2 As Long: dstHdrRow2 = anchorDst2.Row + 1
+    Dim dstFirstDataRow2 As Long: dstFirstDataRow2 = dstHdrRow2 + 1
+    
+    ' Шапка
+    wsSrc.Range(wsSrc.Cells(hdrRow, hdrCol), wsSrc.Cells(hdrRow, hdrCol + 1)).Copy _
+        Destination:=wsDst.Cells(dstHdrRow2, anchorColDst)
+    
+    ' Данные
+    Dim rr As Long
+    For i = 1 To eff2
+        rr = firstDataRow + arrIdx2(order2(i)) - 1
+        wsSrc.Range(wsSrc.Cells(rr, hdrCol), wsSrc.Cells(rr, hdrCol + 1)).Copy _
+            Destination:=wsDst.Cells(dstFirstDataRow2 + i - 1, anchorColDst)
+    Next i
+    Application.CutCopyMode = False
+    
+    ' Рамка только вокруг данных
+    Dim rngBorderData2 As Range
+    Set rngBorderData2 = wsDst.Range( _
+        wsDst.Cells(dstFirstDataRow2, anchorColDst), _
+        wsDst.Cells(dstFirstDataRow2 + eff2 - 1, anchorColDst + 1))
+    Call ThickOuterBorder(rngBorderData2)
+    Call LogWrite("Рамка данных (без шапки, fallback): " & rngBorderData2.Address(False, False))
+    
+    Call LogWrite("Блок '" & anchorTextDst & "' готов (fallback/order): вставлено строк=" & eff2 & _
+                  "; DataRange=" & rngBorderData2.Address(False, False))
+    Exit Sub
+
+
+' --------------------------- ERR HANDLER --------------------------------------
+ErrHandler:
+    Call LogWrite("ОШИБКА в ProcessTopBlock [" & anchorTextSrc & " | step=" & stepTag & "]: " & _
+                  Err.Number & " — " & Err.Description & _
+                  " | hdrRow=" & hdrRow & "; first=" & firstDataRow & "; last=" & lastDataRow & _
+                  "; hdrCol=" & hdrCol & "; dstCol=" & anchorColDst)
+End Sub
+
+
+' ---------------------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -------------------------
+Private Function GetSheetByName(ByVal sheetName As String) As Worksheet
+    On Error Resume Next
+    Set GetSheetByName = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+End Function
+
+
+Private Function FindInColumn(ByVal ws As Worksheet, ByVal colIdx As Long, ByVal whatText As String) As Range
+    Dim rngCol As Range
+    Set rngCol = ws.Columns(colIdx)
+    On Error Resume Next
+    Set FindInColumn = rngCol.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, _
+                                   SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+End Function
+
+
+Private Function FindInRange(ByVal ws As Worksheet, ByVal r1 As Long, ByVal c1 As Long, ByVal r2 As Long, ByVal c2 As Long, ByVal whatText As String) As Range
+    Dim rng As Range
+    Set rng = ws.Range(ws.Cells(r1, c1), ws.Cells(r2, c2))
+    On Error Resume Next
+    Set FindInRange = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, _
+                               SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+End Function
+
+
+Private Sub Get2DSize(ByVal arr As Variant, ByRef nRows As Long, ByRef nCols As Long)
+    On Error GoTo Fail
+    If IsArray(arr) Then
+        nRows = UBound(arr, 1) - LBound(arr, 1) + 1
+        nCols = UBound(arr, 2) - LBound(arr, 2) + 1
+    Else
+        nRows = 0: nCols = 0
+    End If
+    Exit Sub
+Fail:
+    nRows = 0: nCols = 0
+End Sub
+
+
+Private Function ToNumeric(ByVal v As Variant) As Double
+    If IsError(v) Then
+        ToNumeric = 0
+    ElseIf IsNumeric(v) Then
+        ToNumeric = CDbl(v)
+    Else
+        Dim s As String
+        s = CStr(v)
+        s = Replace$(s, " ", "")
+        s = Replace$(s, ChrW(160), "")
+        If IsNumeric(s) Then
+            ToNumeric = CDbl(s)
+        Else
+            ToNumeric = 0
+        End If
+    End If
+End Function
+
+
+Private Function IndexOfMin(ByRef arr() As Double) As Long
+    Dim i As Long, idx As Long, v As Double
+    idx = LBound(arr): v = arr(idx)
+    For i = LBound(arr) + 1 To UBound(arr)
+        If arr(i) < v Then idx = i: v = arr(i)
+    Next i
+    IndexOfMin = idx
+End Function
+
+
+Private Function IndexMinValue(ByRef arr() As Double) As Double
+    Dim i As Long, v As Double
+    v = arr(LBound(arr))
+    For i = LBound(arr) + 1 To UBound(arr)
+        If arr(i) < v Then v = arr(i)
+    Next i
+    IndexMinValue = v
+End Function
+
+
+Private Function MakeOrderDesc(ByRef arrVal() As Double) As Long()
+    Dim L As Long, U As Long
+    L = LBound(arrVal): U = UBound(arrVal)
+    Dim ord() As Long: ReDim ord(1 To (U - L + 1))
+    
+    Dim used() As Boolean: ReDim used(L To U)
+    Dim pos As Long, j As Long, maxJ As Long
+    Dim maxVal As Double, first As Boolean
+    
+    For pos = 1 To U - L + 1
+        first = True
+        For j = L To U
+            If Not used(j) Then
+                If first Then
+                    maxVal = arrVal(j): maxJ = j: first = False
+                ElseIf arrVal(j) > maxVal Then
+                    maxVal = arrVal(j): maxJ = j
+                End If
+            End If
+        Next j
+        ord(pos) = maxJ - L + 1
+        used(maxJ) = True
+    Next pos
+    MakeOrderDesc = ord
+End Function
+
+
+Private Sub ThickOuterBorder(ByVal rng As Range)
+    With rng.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+    End With
+End Sub
+
+
+' ---------------------------- ЛОГИ --------------------------------------------
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1").Value = "Дата/Время"
+        ws.Range("B1").Value = "Сообщение"
+    End If
+    Dim r As Long
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+    On Error GoTo 0
+End Sub

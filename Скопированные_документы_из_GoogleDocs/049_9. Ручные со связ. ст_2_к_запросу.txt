@@ -1,0 +1,562 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modOBS_SyncToRequest
+' Версия:    1.5.2  (19.09.2025)
+'
+' Что нового в 1.5.2:
+'   - FIX: корректная работа, когда между шапкой и "Итого" НЕТ строк (ноль строк) на приёмнике.
+'     Убраны прежние проверки вида (TotalRow <= DataTop) > ошибка. Теперь "Итого" сразу под шапкой
+'     считается валидным состоянием, строки добавляются корректно.
+'   - Аналогично ослаблена проверка по источнику: пустой источник не вызывает ошибку (need=0).
+'   - Добавлено подробное логирование граничных случаев: адреса зон, строки шапки/итого, have/need.
+'
+' Что нового в 1.5.1:
+'   - Удалён пользовательский тип BlockInfo; сбор цветных блоков как Collection Of Range.
+'
+' Назначение:
+'   На листе "4. Операции без содержания"
+'   из блока "Проводки без содержания>>> … Итого" взять ВСЕ цветные строки
+'   и вставить их в "К запросу>>> … Итого", подогнать строки, снять заливки,
+'   проставить формулы "Расхождение = Сумма ? Сумма по документу", итоги под тремя колонками
+'   и нарисовать РОВНО одну внешнюю толстую рамку вокруг вставленных строк.
+'
+' Политика проекта:
+'   - Максимально быстро (без AutoFilter), копирование блоками.
+'   - Подробные логи на лист "Логи". Все LogWrite — Private.
+'   - Без однострочных операторов; без Attribute VB_Name.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.5.2"
+Private Const LOG_SHEET As String = "Логи"
+
+
+' Лист и служебные метки
+Private Const OBS_SHEET As String = "9. Ручные со связ. ст"
+Private Const ANCHOR_COL As Long = 2
+Private Const SRC_ANCHOR_TEXT As String = "Ручные проводки со связанными сторонами>>>"
+Private Const REQ_ANCHOR_TEXT As String = "К запросу>>>"
+Private Const TOTAL_TEXT As String = "Итого"
+
+
+' Ключевые заголовки (рамка)
+Private Const HDR_SUM As String = "Сумма"
+Private Const HDR_SUM_DOC As String = "Сумма по документу"
+Private Const HDR_DIFF As String = "Расхождение"
+
+
+' Числовой формат
+Private Const NUM_FMT As String = "# ##0;-# ##0;-"
+
+
+'========================================================================================
+' ТОЧКА ВХОДА — повесьте на кнопку
+'========================================================================================
+Public Sub К_запросу_ручные_ВГО()
+    Dim t0 As Double
+    t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean
+    Dim evt As Boolean
+    Dim alr As Boolean
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    On Error GoTo EH
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & "OBS SyncToRequest v" & MODULE_VERSION
+
+
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    Set wb = ThisWorkbook
+    Set ws = wb.Worksheets(OBS_SHEET)
+
+
+    ' --- Источник (Проводки без содержания>>> … Итого)
+    Dim s_anchor As Long, s_hdr As Long, s_top As Long
+    Dim s_total As Long, s_bottom As Long, s_lastCol As Long
+
+
+    s_anchor = FindAnchorExact(ws, ANCHOR_COL, SRC_ANCHOR_TEXT)
+    If s_anchor = 0 Then Err.Raise 5, , "Не найден якорь '" & SRC_ANCHOR_TEXT & "' на листе '" & OBS_SHEET & "'."
+
+
+    s_hdr = s_anchor + 1
+    s_top = s_hdr + 1
+    s_total = FindBelowExact(ws, ANCHOR_COL, TOTAL_TEXT, s_top)
+    ' Раньше было: If s_total = 0 Or s_total <= s_top Then Err.Raise ...
+    ' Теперь допускаем s_total = s_top (0 строк в источнике) — это валидно.
+    If s_total = 0 Or s_total < s_top Then Err.Raise 5, , "Не найдено 'Итого' под '" & SRC_ANCHOR_TEXT & "'."
+
+
+    s_bottom = s_total - 1
+    s_lastCol = ws.Cells(s_hdr, ws.Columns.count).End(xlToLeft).Column
+    If s_lastCol < ANCHOR_COL Then s_lastCol = ANCHOR_COL
+
+
+    ' --- Приёмник (К запросу>>> … Итого)
+    Dim d_anchor As Long, d_hdr As Long, d_top As Long
+    Dim d_total As Long, d_bottom As Long, d_lastCol As Long
+
+
+    d_anchor = FindAnchorExact(ws, ANCHOR_COL, REQ_ANCHOR_TEXT)
+    If d_anchor = 0 Then Err.Raise 5, , "Не найден якорь '" & REQ_ANCHOR_TEXT & "' на листе '" & OBS_SHEET & "'."
+
+
+    d_hdr = d_anchor + 1
+    d_top = d_hdr + 1
+    d_total = FindBelowExact(ws, ANCHOR_COL, TOTAL_TEXT, d_top)
+    ' Раньше было: If d_total = 0 Or d_total <= d_top Then Err.Raise ...
+    ' Теперь допускаем d_total = d_top (0 строк в приёмнике) — это валидно.
+    If d_total = 0 Or d_total < d_top Then Err.Raise 5, , "Не найдено 'Итого' под '" & REQ_ANCHOR_TEXT & "'."
+
+
+    If d_total - 1 >= d_top Then
+        d_bottom = d_total - 1
+    Else
+        d_bottom = d_top - 1  ' 0 строк между шапкой и итого — валидно
+    End If
+
+
+    d_lastCol = ws.Cells(d_hdr, ws.Columns.count).End(xlToLeft).Column
+    If d_lastCol < ANCHOR_COL Then d_lastCol = ANCHOR_COL
+
+
+    ' --- Ширина рамки по шапке (от "N" до "Расхождение")
+    Dim frameL As Long, frameR As Long
+    ResolveFrameBounds ws, d_hdr, ANCHOR_COL, d_lastCol, frameL, frameR
+
+
+    LogWrite NowStr() & vbTab & "? Зоны" & vbTab & _
+        "SRC: hdrRow=" & s_hdr & "; dataTop=" & s_top & "; totalRow=" & s_total & _
+        " | DST: hdrRow=" & d_hdr & "; dataTop=" & d_top & "; totalRow=" & d_total & _
+        " | Frame=[" & frameL & "…" & frameR & "]"
+
+
+    ' --- Собираем цветные блоки как диапазоны
+    Dim blocks As Collection
+    Set blocks = CollectColoredRangeBlocks(ws, s_top, s_bottom, ANCHOR_COL, s_lastCol)
+
+
+    Dim need As Long
+    need = TotalRowsInRangeBlocks(blocks)
+
+
+    LogWrite NowStr() & vbTab & "? Цветные" & vbTab & "Блоков=" & blocks.count & "; Строк всего (need)=" & need
+
+
+    ' --- Снести старые границы в приёмнике и подогнать число строк
+    If d_bottom >= d_top Then
+        ClearAllBordersRange ws.Range(ws.Cells(d_top, frameL), ws.Cells(d_bottom, frameR))
+    Else
+        LogWrite NowStr() & vbTab & "DST пуст (0 строк) — чистка границ не требуется"
+    End If
+
+
+    Dim have As Long
+    If d_bottom >= d_top Then
+        have = d_bottom - d_top + 1
+    Else
+        have = 0
+    End If
+    LogWrite NowStr() & vbTab & "? Подгонка" & vbTab & "have=" & have & "; need=" & need
+
+
+    If have < need Then
+        If need - have > 0 Then
+            ws.rows(d_total).Resize(need - have).Insert xlShiftDown
+            d_total = d_total + (need - have)
+            d_bottom = d_top + need - 1
+            LogWrite NowStr() & vbTab & "Вставка строк" & vbTab & (need - have)
+        End If
+    ElseIf have > need Then
+        If have - need > 0 Then
+            ws.rows(d_top + need).Resize(have - need).Delete xlShiftUp
+            d_total = d_total - (have - need)
+            d_bottom = d_top + need - 1
+            LogWrite NowStr() & vbTab & "Удаление лишних строк" & vbTab & (have - need)
+        End If
+    Else
+        LogWrite NowStr() & vbTab & "Подгонка не требуется" & vbTab & "(have=need)"
+    End If
+
+
+    ' --- Очистка значений в зоне вставки (только в пределах рамки)
+    If need > 0 Then
+        ws.Range(ws.Cells(d_top, frameL), ws.Cells(d_top + need - 1, frameR)).ClearContents
+    End If
+
+
+    ' --- Копирование блоками (с форматами), затем снятие заливки внутри рамки
+    Dim dstRow As Long
+    dstRow = d_top
+
+
+    Dim i As Long
+    For i = 1 To blocks.count
+        Dim srcRng As Range
+        Set srcRng = blocks(i)        ' непрерывный цветной диапазон (по всем колонкам источника)
+
+
+        Dim dstRng As Range
+        Set dstRng = ws.Cells(dstRow, ANCHOR_COL)
+
+
+        srcRng.Copy
+        dstRng.PasteSpecial xlPasteAll
+        Application.CutCopyMode = False
+
+
+        ' Снять заливку в пределах рамки для скопированного блока
+        With ws.Range(ws.Cells(dstRow, frameL), ws.Cells(dstRow + srcRng.rows.count - 1, frameR)).Interior
+            .Pattern = xlNone
+            .ColorIndex = xlColorIndexNone
+        End With
+
+
+        LogWrite NowStr() & vbTab & "Копирован блок" & vbTab & _
+            "SRC=" & srcRng.Address(False, False) & " > DST=" & _
+            ws.Range(ws.Cells(dstRow, ANCHOR_COL), ws.Cells(dstRow + srcRng.rows.count - 1, s_lastCol)).Address(False, False) & _
+            "; Rows=" & srcRng.rows.count
+
+
+        dstRow = dstRow + srcRng.rows.count
+    Next i
+
+
+    ' --- Позиции колонок по шапке приёмника
+    Dim cSum As Long, cSumDoc As Long, cDiff As Long
+    cSum = FindHeaderColExact(ws, d_hdr, frameL, frameR, HDR_SUM)
+    cSumDoc = FindHeaderColExact(ws, d_hdr, frameL, frameR, HDR_SUM_DOC)
+    cDiff = FindHeaderColExact(ws, d_hdr, frameL, frameR, HDR_DIFF)
+
+
+    LogWrite NowStr() & vbTab & "? Колонки" & vbTab & "Сумма=" & cSum & "; Док=" & cSumDoc & "; Расх=" & cDiff
+
+
+    ' --- Формулы и форматы по вставленным строкам
+    If need > 0 And cDiff > 0 And cSum > 0 And cSumDoc > 0 Then
+        Dim rngDiff As Range
+        Dim offSum As Long, offDoc As Long
+        Set rngDiff = ws.Range(ws.Cells(d_top, cDiff), ws.Cells(d_top + need - 1, cDiff))
+        offSum = cSum - cDiff
+        offDoc = cSumDoc - cDiff
+        rngDiff.FormulaR1C1 = "=RC[" & offSum & "]-RC[" & offDoc & "]"
+
+
+        ws.Range(ws.Cells(d_top, cSum), ws.Cells(d_top + need - 1, cSum)).NumberFormatLocal = NUM_FMT
+        ws.Range(ws.Cells(d_top, cSumDoc), ws.Cells(d_top + need - 1, cSumDoc)).NumberFormatLocal = NUM_FMT
+        ws.Range(ws.Cells(d_top, cDiff), ws.Cells(d_top + need - 1, cDiff)).NumberFormatLocal = NUM_FMT
+    ElseIf need = 0 Then
+        LogWrite NowStr() & vbTab & "Пропуск формул/форматов" & vbTab & "Нет цветных строк (need=0)"
+    Else
+        LogWrite NowStr() & vbTab & "Пропуск формул/форматов" & vbTab & "Не найдены все нужные колонки"
+    End If
+
+
+    ' --- Итоги под тремя колонками
+    SetTotal ws, d_top, d_total, cSum, need
+    SetTotal ws, d_top, d_total, cSumDoc, need
+    SetTotal ws, d_top, d_total, cDiff, need
+
+
+    ' --- Рамки: убрать любые внутренние и поставить одну внешнюю
+    If need > 0 Then
+        Dim dstFrame As Range
+        Set dstFrame = ws.Range(ws.Cells(d_top, frameL), ws.Cells(d_top + need - 1, frameR))
+        ClearAllBordersRange dstFrame
+        ThickBorder dstFrame
+        LogWrite NowStr() & vbTab & "Рамка" & vbTab & dstFrame.Address(False, False)
+    Else
+        LogWrite NowStr() & vbTab & "Рамка не рисуется" & vbTab & "Нет вставленных строк"
+    End If
+
+
+FinishOK:
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & "Цветных строк=" & need & "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite NowStr() & vbTab & "ОШИБКА" & vbTab & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'========================================================================================
+' ХЕЛПЕРЫ (всё Private)
+'========================================================================================
+
+
+' Заголовки рамки слева направо
+Private Function FrameHeaders() As Variant
+    FrameHeaders = Array( _
+        "N", "Дата", "Документ", _
+        "Счет Дт", "Субконто1 Дт", "Субконто2 Дт", "Субконто3 Дт", _
+        "Счет Кт", "Субконто1 Кт", "Субконто2 Кт", "Субконто3 Кт", _
+        "Сумма", "Содержание", "Проводка", "Ссылка на документ", _
+        "Сумма по документу", "Расхождение" _
+    )
+End Function
+
+
+Private Function FindAnchorExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim f As Range
+    Set f = ws.Columns(col).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindAnchorExact = 0
+    Else
+        If f.MergeCells Then
+            FindAnchorExact = f.MergeArea.Row
+        Else
+            FindAnchorExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindBelowExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim f As Range
+    Set f = ws.Range(ws.Cells(minRow, col), ws.Cells(ws.rows.count, col)).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindBelowExact = 0
+    Else
+        If f.MergeCells Then
+            FindBelowExact = f.MergeArea.Row
+        Else
+            FindBelowExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function NormalizeHeader(ByVal s As String) As String
+    Dim r As String
+    r = Replace$(s, Chr$(160), " ")
+    r = Trim$(r)
+    Do While InStr(r, "  ") > 0
+        r = Replace$(r, "  ", " ")
+    Loop
+    NormalizeHeader = LCase$(r)
+End Function
+
+
+Private Function FindHeaderColExact(ByVal ws As Worksheet, ByVal hdrRow As Long, ByVal firstCol As Long, ByVal lastCol As Long, ByVal headerText As String) As Long
+    Dim c As Long, target As String
+    target = NormalizeHeader(headerText)
+    For c = firstCol To lastCol
+        If NormalizeHeader(CStr(ws.Cells(hdrRow, c).Value)) = target Then
+            FindHeaderColExact = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Sub ResolveFrameBounds(ByVal ws As Worksheet, ByVal hdrRow As Long, ByVal scanFirst As Long, ByVal scanLast As Long, ByRef outFirst As Long, ByRef outLast As Long)
+    Dim heads As Variant, i As Long, c As Long
+    Dim firstFound As Long, lastFound As Long
+
+
+    heads = FrameHeaders()
+    firstFound = 0
+    lastFound = 0
+
+
+    For i = LBound(heads) To UBound(heads)
+        c = FindHeaderColExact(ws, hdrRow, scanFirst, scanLast, CStr(heads(i)))
+        If c > 0 Then
+            If firstFound = 0 Or c < firstFound Then firstFound = c
+            If lastFound = 0 Or c > lastFound Then lastFound = c
+        End If
+    Next i
+
+
+    If firstFound = 0 Or lastFound = 0 Then
+        firstFound = scanFirst
+        lastFound = scanLast
+        LogWrite NowStr() & vbTab & "FrameBounds: не все заголовки найдены, использую фолбэк [" & firstFound & "…" & lastFound & "]."
+    End If
+
+
+    outFirst = firstFound
+    outLast = lastFound
+End Sub
+
+
+Private Function CellHasFill(ByVal c As Range) As Boolean
+    Dim idx As Long
+    On Error Resume Next
+    idx = c.DisplayFormat.Interior.ColorIndex
+    On Error GoTo 0
+    CellHasFill = Not (idx = xlColorIndexNone Or idx = xlColorIndexAutomatic)
+End Function
+
+
+Private Function RowHasFill(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal c1 As Long, ByVal c2 As Long) As Boolean
+    Dim c As Long
+    For c = c1 To c2
+        If CellHasFill(ws.Cells(rowNum, c)) Then
+            RowHasFill = True
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+' Собираем непрерывные цветные блоки построчно; возвращаем Collection Of Range
+Private Function CollectColoredRangeBlocks(ByVal ws As Worksheet, ByVal rTop As Long, ByVal rBottom As Long, ByVal c1 As Long, ByVal c2 As Long) As Collection
+    Dim col As New Collection
+    Dim r As Long
+    Dim inBlock As Boolean
+    Dim startRow As Long
+
+
+    inBlock = False
+    startRow = 0
+
+
+    If rBottom < rTop Then
+        Set CollectColoredRangeBlocks = col
+        Exit Function
+    End If
+
+
+    For r = rTop To rBottom
+        If RowHasFill(ws, r, c1, c2) Then
+            If Not inBlock Then
+                inBlock = True
+                startRow = r
+            End If
+        Else
+            If inBlock Then
+                col.Add ws.Range(ws.Cells(startRow, c1), ws.Cells(r - 1, c2))
+                LogWrite NowStr() & vbTab & "Найден блок" & vbTab & ws.Range(ws.Cells(startRow, c1), ws.Cells(r - 1, c2)).Address(False, False) & "; Rows=" & (r - startRow)
+                inBlock = False
+            End If
+        End If
+
+
+        If (r - rTop) Mod 4000 = 0 Then DoEvents
+    Next r
+
+
+    If inBlock Then
+        col.Add ws.Range(ws.Cells(startRow, c1), ws.Cells(rBottom, c2))
+        LogWrite NowStr() & vbTab & "Найден блок" & vbTab & ws.Range(ws.Cells(startRow, c1), ws.Cells(rBottom, c2)).Address(False, False) & "; Rows=" & (rBottom - startRow + 1)
+    End If
+
+
+    Set CollectColoredRangeBlocks = col
+End Function
+
+
+Private Function TotalRowsInRangeBlocks(ByVal blocks As Collection) As Long
+    Dim i As Long
+    Dim total As Long
+    total = 0
+    For i = 1 To blocks.count
+        Dim rng As Range
+        Set rng = blocks(i)
+        total = total + rng.rows.count
+    Next i
+    TotalRowsInRangeBlocks = total
+End Function
+
+
+Private Sub SetTotal(ByVal ws As Worksheet, ByVal dataTop As Long, ByVal totalRow As Long, ByVal colIdx As Long, ByVal cnt As Long)
+    If colIdx <= 0 Then Exit Sub
+    If totalRow <= 0 Or dataTop <= 0 Then Exit Sub
+
+
+    If cnt > 0 Then
+        Dim rng As Range
+        Set rng = ws.Range(ws.Cells(dataTop, colIdx), ws.Cells(dataTop + cnt - 1, colIdx))
+        ws.Cells(totalRow, colIdx).FormulaLocal = "=СУММ(" & rng.Address(False, False) & ")"
+    Else
+        ws.Cells(totalRow, colIdx).FormulaLocal = "=0"
+    End If
+    ws.Cells(totalRow, colIdx).NumberFormatLocal = NUM_FMT
+End Sub
+
+
+Private Sub ClearAllBordersRange(ByVal rng As Range)
+    On Error Resume Next
+    If rng Is Nothing Then Exit Sub
+    rng.Borders.LineStyle = xlNone
+End Sub
+
+
+Private Sub ThickBorder(ByVal rng As Range)
+    On Error Resume Next
+    If rng Is Nothing Then Exit Sub
+    With rng.Borders(xlEdgeLeft)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeRight)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeTop)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlThick
+        .Color = RGB(0, 0, 0)
+    End With
+End Sub
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Dim r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Модуль", "Сообщение")
+    End If
+    r = ws.Cells(ws.rows.count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "modOBS_SyncToRequest v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

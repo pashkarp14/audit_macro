@@ -1,0 +1,331 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Модуль:    modJP_SetColumnWidths
+' Версия:    1.1.0  (16.09.2025)
+'
+' Что изменено:
+'   - FIX: переменная cDate переименована в colDate (во избежание конфликта с CDate).
+'   - Полный отказ от однострочных конструкций с ":".
+'   - Доп. логи по найденным колонкам.
+'
+' Назначение:
+'   На всех листах с шапкой "Счет Дт", "Счет Кт", "Связанные?" выставить ширины:
+'     • Автоподбор (AutoFit): "Счет Дт", "Счет Кт", "N/№/Номер", "Дата", "Проводка", "Связанные?"
+'     • Остальные: фиксированная ширина ровно 150 пикселей.
+'
+' Производительность:
+'   - ScreenUpdating/Calculation/Alerts отключаются локально.
+'   - Конверсия px→ColumnWidth: (px-5)/7 без итераций.
+'   - Обход листов и поиск шапки — один проход.
+'   - Логирование (подробно) на лист "Логи".
+'===============================================================================
+
+
+Private Const MODULE_VERSION As String = "1.1.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+'============================== ТОЧКИ ВХОДА ====================================
+
+
+Public Sub Установить_Ширины_ЖП()
+    Dim t0 As Double
+    t0 = Timer
+    Private_StartPerf
+    On Error GoTo EH
+
+
+    Private_Log "Старт SetWidths v" & MODULE_VERSION
+
+
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+
+    Dim ws As Worksheet
+    Dim processed As Long
+
+
+    For Each ws In wb.Worksheets
+        If IsProcessedJPSheet(ws) Then
+            ApplyWidthsOnSheet ws
+            processed = processed + 1
+        End If
+    Next ws
+
+
+    Private_Log "Готово: обработано листов=" & processed & "; " & Format$(Timer - t0, "0.00") & " c"
+    Private_FinishPerf
+    Exit Sub
+
+
+EH:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+    Private_FinishPerf
+End Sub
+
+
+Public Sub Установить_Ширины_ЖП_Только_Активный()
+    Dim t0 As Double
+    t0 = Timer
+    Private_StartPerf
+    On Error GoTo EH
+
+
+    If IsProcessedJPSheet(ActiveSheet) Then
+        ApplyWidthsOnSheet ActiveSheet
+        Private_Log "Готово (активный): '" & ActiveSheet.Name & "'; " & Format$(Timer - t0, "0.00") & " c"
+    Else
+        Private_Log "Активный лист не похож на обработанный ЖП (нет ключевых заголовков)"
+    End If
+
+
+    Private_FinishPerf
+    Exit Sub
+
+
+EH:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+    Private_FinishPerf
+End Sub
+
+
+'============================== ОСНОВНАЯ ЛОГИКА ================================
+
+
+Private Sub ApplyWidthsOnSheet(ByVal ws As Worksheet)
+    Dim hdrRow As Long
+    hdrRow = 1
+
+
+    ' Ищем целевые колонки по заголовкам
+    Dim colDt As Long
+    colDt = FindHeaderColExact(ws, "Счет Дт", hdrRow)
+
+
+    Dim colKt As Long
+    colKt = FindHeaderColExact(ws, "Счет Кт", hdrRow)
+
+
+    Dim colLinked As Long
+    colLinked = FindHeaderColExact(ws, "Связанные?", hdrRow)
+
+
+    Dim colNum As Long
+    colNum = FindHeaderColAny(ws, hdrRow, Array("N", "№", "Номер"))
+
+
+    Dim colDate As Long
+    colDate = FindHeaderColExact(ws, "Дата", hdrRow)
+
+
+    Dim colProv As Long
+    colProv = FindHeaderColExact(ws, "Проводка", hdrRow)
+
+
+    If colDt = 0 Or colKt = 0 Or colLinked = 0 Then
+        Private_Log "Пропуск '" & ws.Name & "': нет одной из колонок (Счет Дт/Счет Кт/Связанные?)"
+        Exit Sub
+    End If
+
+
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+
+
+    Private_Log "Лист '" & ws.Name & "': " & _
+                "Дт=" & colDt & "; Кт=" & colKt & "; Связанные?=" & colLinked & _
+                "; N/№/Номер=" & ReportZero(colNum) & _
+                "; Дата=" & ReportZero(colDate) & _
+                "; Проводка=" & ReportZero(colProv) & _
+                "; lastCol=" & lastCol
+
+
+    ' Маска автоподбора
+    Dim autoFitMask() As Boolean
+    ReDim autoFitMask(1 To lastCol)
+
+
+    If colDt > 0 Then autoFitMask(colDt) = True
+    If colKt > 0 Then autoFitMask(colKt) = True
+    If colNum > 0 Then autoFitMask(colNum) = True
+    If colDate > 0 Then autoFitMask(colDate) = True
+    If colProv > 0 Then autoFitMask(colProv) = True
+    If colLinked > 0 Then autoFitMask(colLinked) = True
+
+
+    ' Автоподбор целевых
+    Dim autoCount As Long
+    Dim c As Long
+    For c = 1 To lastCol
+        If autoFitMask(c) Then
+            ws.Columns(c).AutoFit
+            autoCount = autoCount + 1
+        End If
+    Next c
+
+
+    ' Остальные — фиксировано 150 px
+    Dim fixedCount As Long
+    Dim cw150 As Double
+    cw150 = ColumnWidthFromPixels(150)
+
+
+    For c = 1 To lastCol
+        If Not autoFitMask(c) Then
+            ws.Columns(c).ColumnWidth = cw150
+            fixedCount = fixedCount + 1
+        End If
+    Next c
+
+
+    Private_Log "Ширины выставлены: AutoFit=" & autoCount & "; Fixed(150px)=" & fixedCount
+End Sub
+
+
+'============================== ПОИСК ШАПКИ ====================================
+
+
+Private Function FindHeaderColExact(ByVal ws As Worksheet, ByVal headerText As String, ByVal hdrRow As Long) As Long
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+
+
+    Dim c As Long
+    Dim t As String
+    Dim target As String
+
+
+    target = NormalizeHeaderText(headerText)
+
+
+    For c = 1 To lastCol
+        t = NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        If t = target Then
+            FindHeaderColExact = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Function FindHeaderColAny(ByVal ws As Worksheet, ByVal hdrRow As Long, ByVal names As Variant) As Long
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+
+
+    Dim c As Long
+    Dim i As Long
+    Dim t As String
+    Dim target As String
+
+
+    For c = 1 To lastCol
+        t = NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        For i = LBound(names) To UBound(names)
+            target = NormalizeHeaderText(CStr(names(i)))
+            If t = target Then
+                FindHeaderColAny = c
+                Exit Function
+            End If
+        Next i
+    Next c
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String
+    nb = Chr$(160) ' NBSP
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+
+
+    ' ё/Ё -> е/Е (чтобы не спотыкаться об разные раскладки)
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+
+
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+
+
+    NormalizeHeaderText = LCase$(s)
+End Function
+
+
+Private Function IsProcessedJPSheet(ByVal ws As Worksheet) As Boolean
+    IsProcessedJPSheet = (FindHeaderColExact(ws, "Счет Дт", 1) > 0 And _
+                          FindHeaderColExact(ws, "Счет Кт", 1) > 0 And _
+                          FindHeaderColExact(ws, "Связанные?", 1) > 0)
+End Function
+
+
+'============================== ПИКСЕЛИ → COLUMNWIDTH ==========================
+
+
+Private Function ColumnWidthFromPixels(ByVal px As Long) As Double
+    Dim cw As Double
+    cw = (px - 5) / 7#
+    If cw < 0# Then cw = 0#
+    ColumnWidthFromPixels = cw
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub Private_Log(ByVal msg As String)
+    Dim ws As Worksheet
+    Dim r As Long
+
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    On Error GoTo 0
+
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+
+
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "JP SetWidths v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Sub Private_StartPerf()
+    On Error Resume Next
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    On Error GoTo 0
+End Sub
+
+
+Private Sub Private_FinishPerf()
+    On Error Resume Next
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    On Error GoTo 0
+End Sub
+
+
+Private Function ReportZero(ByVal v As Long) As String
+    If v > 0 Then
+        ReportZero = CStr(v)
+    Else
+        ReportZero = "нет"
+    End If
+End Function

@@ -1,0 +1,804 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modHOL_RequestMarker
+' Версия:    1.4.3  (06.10.2025)
+'
+' Что нового vs 1.4.2:
+'   - Изменена логика по "Итого":
+'       • Если "Итого" НЕ найдено — это ОШИБКА (Err.Raise).
+'       • Если "Итого" сразу под шапкой (между ними нет строк) — считаем ПУСТОЙ запрос
+'         и снимаем все метки этого теста из популяции.
+'   - Везде унифицировано на RM_StartStep/RM_EndStep (неиспользуем StartStep/EndStep без префикса).
+'   - Сохранены фиксы: анти-TypeMismatch (одна строка), нормализация Range.Value2 в 2D (RM_ToCol2D).
+'
+' Назначение:
+'   Синхронизация метки ПРОТЕСТИРОВАНО? (TEST_LABEL) в популяции по данным из зоны "К запросу>>>"
+'   (или по JE_ID при включённом режиме). Пустой запрос (Итого сразу под шапкой) -> снятие всех меток.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.4.3"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' --- Где искать "К запросу>>>"
+Private Const DST_SHEET       As String = "12. Ключевые слова"
+Private Const ANCHOR_COL      As Long = 2
+Private Const REQ_ANCHOR_TEXT As String = "К запросу>>>"
+Private Const TOTAL_TEXT      As String = "Итого"
+
+
+' --- Где искать популяцию
+Private Const POP_BASE      As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF As String = "_Ч"
+
+
+' --- Колонка-назначение (единый флаг всех тестов)
+Private Const PROCESSED_HEADER_NAME As String = "Протестировано?"
+' --- Значение для этого конкретного теста
+Private Const TEST_LABEL As String = "См. ключевые слова"
+
+
+' --- Режим ключей
+Private Const USE_JE_ID_IF_UNIQUE As Boolean = False
+
+
+' --- Прогресс-чанки для логов
+Private Const PROGRESS_ROW_MODE As Long = 100000
+Private Const PROGRESS_JE_MODE  As Long = 200000
+
+
+' Переменные для логов шагов
+Private RM_currentStep As String
+Private RM_stepT As Double
+
+
+'========================================================================================
+' ПУБЛИЧНАЯ ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Отметить_ключевые_К_Запросу()
+    Dim t0 As Double: t0 = Timer
+    RM_LogWrite "Старт Отметить_ОБС_К_Запросу v" & MODULE_VERSION & " — валидатор 'Итого' + пустой запрос"
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+
+
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    ' --- 1) Зона "К запросу>>>"
+    RM_StartStep "Поиск зоны 'К запросу>>>' и границ"
+    Dim wsReq As Worksheet
+    Set wsReq = ThisWorkbook.Worksheets(DST_SHEET)
+
+
+    Dim anchorRow As Long
+    anchorRow = RM_FindAnchorRow(wsReq, REQ_ANCHOR_TEXT)
+    If anchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & REQ_ANCHOR_TEXT & "' на листе '" & DST_SHEET & "'."
+
+
+    Dim hdrRow As Long, dataTop As Long, totalRow As Long, dataBottom As Long
+    Dim zeroRequest As Boolean
+    hdrRow = anchorRow + 1
+    dataTop = hdrRow + 1
+
+
+    totalRow = RM_FindBelowExact(wsReq, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Then
+        ' Требование заказчика: отсутствие "Итого" — это ошибка.
+        Err.Raise 5, , "Метка 'Итого' не найдена под 'К запросу>>>' на листе '" & DST_SHEET & "'."
+    ElseIf totalRow <= dataTop Then
+        ' "Итого" сразу под шапкой (между ними нет строк) — пустой запрос
+        zeroRequest = True
+        dataBottom = dataTop - 1
+        RM_LogWrite "Между шапкой и 'Итого' нет строк — ПУСТОЙ запрос (снятие всех меток)."
+    Else
+        dataBottom = totalRow - 1
+    End If
+
+
+    Dim rowsCount As Long
+    If dataBottom >= dataTop Then
+        rowsCount = dataBottom - dataTop + 1
+    Else
+        rowsCount = 0
+    End If
+
+
+    RM_LogWrite "? К запросу: HeaderRow=" & hdrRow & "; DataTop=" & dataTop & _
+                "; DataBottom=" & dataBottom & "; TotalRow=" & totalRow & _
+                "; RowsCount=" & rowsCount & "; ZeroRequest=" & zeroRequest
+    RM_EndStep
+
+
+    ' --- 2) Шапка и игнор
+    RM_StartStep "Построение карты шапки и набора игнора"
+    Dim hdrMapReq As Object
+    Set hdrMapReq = RM_BuildHeaderMap(wsReq, hdrRow)
+    If hdrMapReq Is Nothing Then Err.Raise 91, , "RM_BuildHeaderMap вернул Nothing (К запросу)."
+    If hdrMapReq.Count = 0 Then Err.Raise 91, , "Шапка 'К запросу>>>' пуста (нет ни одного заголовка)."
+
+
+    Dim colsIgnore As Object
+    Set colsIgnore = RM_BuildIgnoreSet()
+    If colsIgnore Is Nothing Then Err.Raise 91, , "RM_BuildIgnoreSet вернул Nothing."
+
+
+    RM_LogWrite "? Шапка 'К запросу>>>': всего полей=" & hdrMapReq.Count & _
+                "; игнорируемых (синонимов)=" & colsIgnore.Count
+    RM_EndStep
+
+
+    ' --- 3) Поиск листов популяции
+    RM_StartStep "Поиск листов популяции"
+    Dim popSheets As Collection
+    Set popSheets = RM_GetPopulationSheets()
+    If popSheets Is Nothing Or popSheets.Count = 0 Then Err.Raise 5, , "Листы популяции не найдены."
+    RM_LogWrite "Найдено листов популяции: " & popSheets.Count
+    RM_EndStep
+
+
+    ' --- 4) Синхронизация
+    RM_StartStep "Синхронизация меток в популяции (поставить/снять)"
+    Dim totalSet As Long, totalCleared As Long
+    Dim ws As Worksheet
+
+
+    If zeroRequest Then
+        ' Пустой запрос -> снимаем все TEST_LABEL во всех листах популяции
+        For Each ws In popSheets
+            Dim hdrMapPopZ As Object
+            Set hdrMapPopZ = RM_BuildHeaderMap(ws, 1)
+            Dim clearedZ As Long
+            RM_ClearAllTestMarks ws, hdrMapPopZ, clearedZ
+            totalCleared = totalCleared + clearedZ
+            RM_LogWrite "Лист '" & ws.Name & "': пустой запрос — снято меток=" & clearedZ
+        Next ws
+    Else
+        ' Попробуем JE_ID, если включено и поле есть в "К запросу"
+        Dim jeColReq As Long
+        jeColReq = RM_FindHeaderInMap(hdrMapReq, RM_SynJE())
+
+
+        For Each ws In popSheets
+            Dim setC As Long, clrC As Long
+            If USE_JE_ID_IF_UNIQUE And jeColReq > 0 Then
+                Dim reqKeysJE As Object
+                Set reqKeysJE = RM_BuildKeysJE(wsReq, dataTop, dataBottom, jeColReq)
+                RM_LogWrite "Лист '" & ws.Name & "': режим JE_ID; ключей=" & reqKeysJE.Count
+                RM_MarkByJE ws, reqKeysJE, setC, clrC
+            Else
+                RM_MarkByROW ws, wsReq, hdrMapReq, colsIgnore, dataTop, dataBottom, setC, clrC
+            End If
+            totalSet = totalSet + setC
+            totalCleared = totalCleared + clrC
+            RM_LogWrite "Лист '" & ws.Name & "': поставлено=" & setC & "; снято=" & clrC
+        Next ws
+    End If
+
+
+    RM_LogWrite "ИТОГО: поставлено=" & totalSet & "; снято=" & totalCleared & ". Время, сек: " & Format$(Timer - t0, "0.000")
+    RM_EndStep
+    GoTo TIDY
+
+
+EH:
+    RM_LogWrite "ОШИБКА: " & Err.Number & " — " & Err.Description
+
+
+TIDY:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+End Sub
+
+
+'========================================================================================
+' ОСНОВНЫЕ РЕАЛИЗАЦИИ
+'========================================================================================
+
+
+Private Sub RM_MarkByJE(ByVal ws As Worksheet, ByVal reqKeys As Object, ByRef setCount As Long, ByRef clearCount As Long)
+    On Error GoTo EH
+    Dim hdrMap As Object: Set hdrMap = RM_BuildHeaderMap(ws, 1)
+    If hdrMap Is Nothing Then Exit Sub
+
+
+    Dim jeCol As Long: jeCol = RM_FindHeaderInMap(hdrMap, RM_SynJE())
+    If jeCol = 0 Then Exit Sub
+
+
+    Dim markCol As Long: markCol = RM_EnsureMarkCol(ws, hdrMap)
+
+
+    Dim lastRow As Long: lastRow = RM_LastDataRow(ws, jeCol)
+    If lastRow < 2 Then Exit Sub
+
+
+    Dim rngJE As Range, rngM As Range
+    Set rngJE = ws.Range(ws.Cells(2, jeCol), ws.Cells(lastRow, jeCol))
+    Set rngM = ws.Range(ws.Cells(2, markCol), ws.Cells(lastRow, markCol))
+
+
+    Dim vJE As Variant, vM As Variant
+    vJE = RM_ToCol2D(rngJE.Value2)
+    vM  = RM_ToCol2D(rngM.Value2)
+
+
+    Dim i As Long, k As String
+    For i = 1 To UBound(vJE, 1)
+        k = RM_NormKey(CStr(vJE(i, 1)))
+        If Len(k) > 0 Then
+            If reqKeys.Exists(k) Then
+                If CStr(vM(i, 1)) <> TEST_LABEL Then
+                    vM(i, 1) = TEST_LABEL
+                    setCount = setCount + 1
+                End If
+            Else
+                If CStr(vM(i, 1)) = TEST_LABEL Then
+                    vM(i, 1) = ""
+                    clearCount = clearCount + 1
+                End If
+            End If
+        End If
+        If (i Mod PROGRESS_JE_MODE) = 0 Then RM_LogWrite "... " & ws.Name & " JE: обработано " & i & " строк; +=" & setCount & "; -=" & clearCount
+    Next i
+
+
+    rngM.Value = vM
+    Exit Sub
+EH:
+    RM_LogWrite "ОШИБКА RM_MarkByJE[" & ws.Name & "]: " & Err.Number & " — " & Err.Description
+End Sub
+
+
+Private Sub RM_MarkByROW( _
+    ByVal wsPop As Worksheet, _
+    ByVal wsReq As Worksheet, _
+    ByVal hdrMapReq As Object, _
+    ByVal colsIgnore As Object, _
+    ByVal reqR1 As Long, _
+    ByVal reqR2 As Long, _
+    ByRef setCount As Long, _
+    ByRef clearCount As Long)
+
+
+    On Error GoTo EH
+
+
+    Dim hdrMapPop As Object
+    Set hdrMapPop = RM_BuildHeaderMap(wsPop, 1)
+    If hdrMapPop Is Nothing Then
+        RM_LogWrite "Предупреждение: пустая шапка на '" & wsPop.Name & "'. Пропуск."
+        Exit Sub
+    End If
+
+
+    ' Общие колонки для сравнения (после игнора)
+    Dim commonColsPop() As Long, commonColsReq() As Long, n As Long
+    RM_BuildCommonCols hdrMapReq, hdrMapPop, colsIgnore, commonColsReq, commonColsPop, n
+    If n = 0 Then
+        RM_LogWrite "Предупреждение: нет общих колонок для сравнения на листе '" & wsPop.Name & "'. Пропуск."
+        Exit Sub
+    End If
+
+
+    ' Лог состав сравниваемых полей
+    RM_LogCommonCols wsPop.Name, hdrMapReq, hdrMapPop, commonColsReq, commonColsPop, n
+
+
+    ' Ключи "К запросу>>>", только по общим колонкам
+    Dim dataReq As Variant
+    dataReq = RM_ReadColumnsBlock(wsReq, reqR1, reqR2, commonColsReq)
+
+
+    Dim keysReq() As String
+    keysReq = RM_BuildRowKeysFromBlock(dataReq, commonColsReq, n)
+
+
+    Dim setReq As Object
+    Set setReq = CreateObject("Scripting.Dictionary")
+    setReq.CompareMode = 0
+
+
+    Dim i As Long
+    For i = 1 To UBound(keysReq)
+        If Len(keysReq(i)) > 0 Then
+            If Not setReq.Exists(keysReq(i)) Then setReq(keysReq(i)) = True
+        End If
+    Next i
+
+
+    ' Данные популяции по тем же колонкам
+    Dim lastRow As Long
+    lastRow = RM_LastDataRow(wsPop, commonColsPop(1))
+    If lastRow < 2 Then Exit Sub
+
+
+    Dim dataPop As Variant
+    dataPop = RM_ReadColumnsBlock(wsPop, 2, lastRow, commonColsPop)
+
+
+    Dim keysPop() As String
+    keysPop = RM_BuildRowKeysFromBlock(dataPop, commonColsPop, n)
+
+
+    ' Столбец метки
+    Dim markCol As Long
+    markCol = RM_EnsureMarkCol(wsPop, hdrMapPop)
+
+
+    Dim rngM As Range, vM As Variant
+    Set rngM = wsPop.Range(wsPop.Cells(2, markCol), wsPop.Cells(lastRow, markCol))
+    vM = RM_ToCol2D(rngM.Value2)
+
+
+    ' Синхронизация меток
+    For i = 1 To UBound(keysPop)
+        If Len(keysPop(i)) > 0 Then
+            If setReq.Exists(keysPop(i)) Then
+                If CStr(vM(i, 1)) <> TEST_LABEL Then
+                    vM(i, 1) = TEST_LABEL
+                    setCount = setCount + 1
+                End If
+            Else
+                If CStr(vM(i, 1)) = TEST_LABEL Then
+                    vM(i, 1) = ""
+                    clearCount = clearCount + 1
+                End If
+            End If
+        End If
+        If (i Mod PROGRESS_ROW_MODE) = 0 Then RM_LogWrite "... " & wsPop.Name & " ROW: обработано " & i & " строк; +=" & setCount & "; -=" & clearCount
+    Next i
+
+
+    rngM.Value = vM
+    Exit Sub
+
+
+EH:
+    RM_LogWrite "ОШИБКА RM_MarkByROW[" & wsPop.Name & "]: " & Err.Number & " — " & Err.Description
+End Sub
+
+
+'========================================================================================
+' ПОСТРОЕНИЕ КЛЮЧЕЙ
+'========================================================================================
+
+
+Private Function RM_BuildKeysJE(ByVal ws As Worksheet, ByVal r1 As Long, ByVal r2 As Long, ByVal jeCol As Long) As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 0
+
+
+    Dim v As Variant: v = ws.Range(ws.Cells(r1, jeCol), ws.Cells(r2, jeCol)).Value2
+    Dim i As Long, k As String
+
+
+    If IsArray(v) Then
+        For i = 1 To UBound(v, 1)
+            k = RM_NormKey(CStr(v(i, 1)))
+            If Len(k) > 0 Then If Not dict.Exists(k) Then dict(k) = True
+        Next i
+    Else
+        k = RM_NormKey(CStr(v))
+        If Len(k) > 0 Then dict(k) = True
+    End If
+    Set RM_BuildKeysJE = dict
+End Function
+
+
+' data: Variant (1..rows, 1..nCols)
+Private Function RM_BuildRowKeysFromBlock(ByVal data As Variant, ByRef cols() As Long, ByVal n As Long) As String()
+    Dim r As Long, c As Long, rows As Long
+    rows = UBound(data, 1)
+
+
+    Dim keys() As String
+    ReDim keys(1 To rows)
+
+
+    Dim parts() As String
+    ReDim parts(1 To n)
+
+
+    For r = 1 To rows
+        For c = 1 To n
+            parts(c) = RM_CanonicalValue(data(r, c))
+        Next c
+        keys(r) = Join(parts, "|")
+        If (r Mod PROGRESS_ROW_MODE) = 0 Then RM_LogWrite "... построено ключей: " & r
+    Next r
+    RM_BuildRowKeysFromBlock = keys
+End Function
+
+
+'========================================================================================
+' УТИЛИТЫ ДЛЯ ДАННЫХ/ШАПОК
+'========================================================================================
+
+
+Private Function RM_BuildHeaderMap(ByVal ws As Worksheet, ByVal hdrRow As Long) As Object
+    On Error GoTo EH
+    Dim map As Object: Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = 0
+
+
+    If ws Is Nothing Then GoTo OutOk
+    If hdrRow < 1 Then GoTo OutOk
+
+
+    Dim lastCol As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then GoTo OutOk
+
+
+    Dim c As Long, key As String
+    For c = 1 To lastCol
+        key = RM_NormHdr(CStr(ws.Cells(hdrRow, c).Value))
+        If Len(key) > 0 Then
+            If Not map.Exists(key) Then map(key) = c
+        End If
+    Next c
+
+
+OutOk:
+    Set RM_BuildHeaderMap = map
+    Exit Function
+EH:
+    Set RM_BuildHeaderMap = map
+End Function
+
+
+Private Function RM_FindHeaderInMap(ByVal hdrMap As Object, ByVal syns As Variant) As Long
+    On Error Resume Next
+    Dim i As Long, k As String
+    If hdrMap Is Nothing Then Exit Function
+    For i = LBound(syns) To UBound(syns)
+        k = RM_NormHdr(CStr(syns(i)))
+        If hdrMap.Exists(k) Then RM_FindHeaderInMap = CLng(hdrMap(k)): Exit Function
+    Next i
+End Function
+
+
+Private Sub RM_BuildCommonCols( _
+    ByVal hdrReq As Object, _
+    ByVal hdrPop As Object, _
+    ByVal colsIgnore As Object, _
+    ByRef colsReq() As Long, _
+    ByRef colsPop() As Long, _
+    ByRef n As Long)
+
+
+    Dim keys As Variant
+    If hdrReq Is Nothing Or hdrPop Is Nothing Then n = 0: Exit Sub
+    keys = hdrReq.Keys
+
+
+    Dim tReq() As Long, tPop() As Long
+    ReDim tReq(1 To UBound(keys) + 1)
+    ReDim tPop(1 To UBound(keys) + 1)
+
+
+    Dim i As Long, cnt As Long, k As String
+    For i = LBound(keys) To UBound(keys)
+        k = CStr(keys(i))
+        If Not colsIgnore.Exists(k) Then
+            If hdrPop.Exists(k) Then
+                cnt = cnt + 1
+                tReq(cnt) = CLng(hdrReq(k))
+                tPop(cnt) = CLng(hdrPop(k))
+            End If
+        End If
+    Next i
+
+
+    If cnt = 0 Then n = 0: Exit Sub
+
+
+    ReDim colsReq(1 To cnt): ReDim colsPop(1 To cnt)
+    For i = 1 To cnt
+        colsReq(i) = tReq(i)
+        colsPop(i) = tPop(i)
+    Next i
+    n = cnt
+End Sub
+
+
+Private Function RM_ReadColumnsBlock(ByVal ws As Worksheet, ByVal r1 As Long, ByVal r2 As Long, ByRef cols() As Long) As Variant
+    Dim n As Long: n = UBound(cols) - LBound(cols) + 1
+    Dim data As Variant
+    ReDim data(1 To r2 - r1 + 1, 1 To n)
+
+
+    Dim j As Long, c As Long, colValues As Variant, i As Long
+    For j = 1 To n
+        c = cols(LBound(cols) + j - 1)
+        colValues = RM_ToCol2D(ws.Range(ws.Cells(r1, c), ws.Cells(r2, c)).Value2)
+        For i = 1 To UBound(colValues, 1)
+            data(i, j) = colValues(i, 1)
+        Next i
+        If (j Mod 20) = 0 Then RM_LogWrite "...читаны столбцы: " & j & " из " & n
+    Next j
+    RM_ReadColumnsBlock = data
+End Function
+
+
+'========================================================================================
+' НОРМАЛИЗАЦИЯ И СЛОВАРИ
+'========================================================================================
+
+
+' Превращает скаляр в колонку-массив (1 x 1); если уже массив — возвращает как есть.
+Private Function RM_ToCol2D(ByVal v As Variant) As Variant
+    If IsArray(v) Then
+        RM_ToCol2D = v
+    Else
+        Dim a As Variant
+        ReDim a(1 To 1, 1 To 1)
+        a(1, 1) = v
+        RM_ToCol2D = a
+    End If
+End Function
+
+
+Private Function RM_CanonicalValue(ByVal v As Variant) As String
+    On Error GoTo AsText
+    If IsError(v) Then RM_CanonicalValue = "#ERR": Exit Function
+    If IsEmpty(v) Then RM_CanonicalValue = "": Exit Function
+    If IsDate(v) Then RM_CanonicalValue = Format$(CDate(v), "yyyy-mm-dd"): Exit Function
+    If IsNumeric(v) Then
+        Dim d As Double: d = CDbl(v)
+        If d = Fix(d) Then
+            RM_CanonicalValue = CStr(Fix(d))
+        Else
+            RM_CanonicalValue = Replace$(CStr(d), ",", ".")
+        End If
+        Exit Function
+    End If
+AsText:
+    Dim s As String
+    s = CStr(v)
+    s = Replace$(s, ChrW(160), " ")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    RM_CanonicalValue = s
+End Function
+
+
+Private Function RM_NormHdr(ByVal s As String) As String
+    s = Replace$(s, ChrW(160), " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    RM_NormHdr = LCase$(s)
+End Function
+
+
+Private Function RM_NormKey(ByVal s As String) As String
+    s = Replace$(s, ChrW(160), " ")
+    s = Trim$(s)
+    RM_NormKey = s
+End Function
+
+
+Private Function RM_SynJE() As Variant
+    RM_SynJE = Array("je_id", "jeid", "id проводки", "id", "guid", "hash", "хэш", "хеш")
+End Function
+
+
+' Синонимы для служебных колонок (их НЕ сравниваем)
+Private Function RM_SynIgnoreCols() As Variant
+    RM_SynIgnoreCols = Array( _
+        "связанные?", "ответственный", _
+        "протестировано?", "obs flag", "test obs", "обс?", _
+        "комментарий", "примечание", _
+        "сумма по документу", "расхождение" _
+    )
+End Function
+
+
+Private Function RM_BuildIgnoreSet() As Object
+    Dim setD As Object: Set setD = CreateObject("Scripting.Dictionary")
+    setD.CompareMode = 0
+
+
+    Dim arr As Variant, i As Long
+    arr = RM_SynIgnoreCols()
+    For i = LBound(arr) To UBound(arr)
+        setD(RM_NormHdr(CStr(arr(i)))) = True
+    Next i
+
+
+    ' Сам столбец метки тоже исключаем
+    setD(RM_NormHdr(PROCESSED_HEADER_NAME)) = True
+
+
+    Set RM_BuildIgnoreSet = setD
+End Function
+
+
+'========================================================================================
+' ПРОЧЕЕ
+'========================================================================================
+
+
+Private Function RM_GetPopulationSheets() As Collection
+    Dim col As New Collection, sh As Worksheet, nm As String
+    For Each sh In ThisWorkbook.Worksheets
+        nm = sh.Name
+        If nm = POP_BASE Then
+            col.Add sh
+        ElseIf Left$(nm, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+    Set RM_GetPopulationSheets = col
+End Function
+
+
+Private Function RM_FindAnchorRow(ByVal ws As Worksheet, ByVal anchorText As String) As Long
+    Dim f As Range
+    Set f = ws.Columns(ANCHOR_COL).Find(What:=anchorText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        RM_FindAnchorRow = 0
+    Else
+        If f.MergeCells Then RM_FindAnchorRow = f.MergeArea.Row Else RM_FindAnchorRow = f.Row
+    End If
+End Function
+
+
+Private Function RM_FindBelowExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim f As Range
+    Set f = ws.Range(ws.Cells(minRow, col), ws.Cells(ws.Rows.Count, col)).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        RM_FindBelowExact = 0
+    Else
+        If f.MergeCells Then RM_FindBelowExact = f.MergeArea.Row Else RM_FindBelowExact = f.Row
+    End If
+End Function
+
+
+' Возвращает индекс колонки метки, создаёт его, если нет
+Private Function RM_EnsureMarkCol(ByVal ws As Worksheet, ByVal hdrMap As Object) As Long
+    Dim k As String: k = RM_NormHdr(PROCESSED_HEADER_NAME)
+    If Not (hdrMap Is Nothing) Then
+        If hdrMap.Exists(k) Then RM_EnsureMarkCol = CLng(hdrMap(k)): Exit Function
+    End If
+    Dim lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    RM_EnsureMarkCol = lastCol + 1
+    ws.Cells(1, RM_EnsureMarkCol).Value = PROCESSED_HEADER_NAME
+End Function
+
+
+' Снять все TEST_LABEL, если колонка метки существует (колонку не создаём)
+Private Sub RM_ClearAllTestMarks(ByVal ws As Worksheet, ByVal hdrMap As Object, ByRef cleared As Long)
+    On Error GoTo EH
+    cleared = 0
+    If hdrMap Is Nothing Then Exit Sub
+
+
+    Dim markCol As Long
+    markCol = RM_FindHeaderInMap(hdrMap, Array(PROCESSED_HEADER_NAME))
+    If markCol = 0 Then Exit Sub
+
+
+    Dim lr As Long
+    lr = RM_LastDataRow(ws, markCol)
+    If lr < 2 Then Exit Sub
+
+
+    Dim rng As Range
+    Set rng = ws.Range(ws.Cells(2, markCol), ws.Cells(lr, markCol))
+
+
+    Dim v As Variant
+    v = RM_ToCol2D(rng.Value2)
+
+
+    Dim i As Long
+    For i = 1 To UBound(v, 1)
+        If CStr(v(i, 1)) = TEST_LABEL Then
+            v(i, 1) = ""
+            cleared = cleared + 1
+        End If
+    Next i
+
+
+    rng.Value = v
+    Exit Sub
+EH:
+    RM_LogWrite "ОШИБКА RM_ClearAllTestMarks[" & ws.Name & "]: " & Err.Number & " — " & Err.Description
+End Sub
+
+
+Private Function RM_LastDataRow(ByVal ws As Worksheet, ByVal col As Long) As Long
+    Dim lr As Long
+    lr = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+    If lr < 2 Then lr = 2
+    RM_LastDataRow = lr
+End Function
+
+
+' Лог: какие общие колонки участвуют (для отладки)
+Private Sub RM_LogCommonCols(ByVal popName As String, ByVal hdrReq As Object, ByVal hdrPop As Object, ByRef colsReq() As Long, ByRef colsPop() As Long, ByVal n As Long)
+    On Error Resume Next
+    Dim i As Long, txt As String
+    txt = "Общие колонки (" & n & ") для '" & popName & "': "
+    For i = 1 To n
+        txt = txt & "[" & RM_ColNameByIndex(hdrReq, colsReq(i)) & "]"
+        If i < n Then txt = txt & ", "
+    Next i
+    RM_LogWrite txt
+End Sub
+
+
+Private Function RM_ColNameByIndex(ByVal hdrMap As Object, ByVal idx As Long) As String
+    On Error Resume Next
+    Dim k As Variant
+    For Each k In hdrMap.Keys
+        If CLng(hdrMap(k)) = idx Then RM_ColNameByIndex = CStr(k): Exit Function
+    Next k
+End Function
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+Private Sub RM_LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub RM_StartStep(ByVal stepName As String)
+    RM_currentStep = stepName
+    RM_stepT = Timer
+    RM_LogWrite RM_NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub RM_EndStep()
+    RM_LogWrite RM_NowStr() & vbTab & "<< " & RM_currentStep & "  (" & Format$(Timer - RM_stepT, "0.00") & " сек)"
+    RM_currentStep = vbNullString
+End Sub
+
+
+Private Function RM_NowStr() As String
+    RM_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

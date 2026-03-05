@@ -1,0 +1,658 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modPopulation_Build
+' Версия:    1.1.2  (16.09.2025)
+'
+' Что нового vs 1.1.1:
+'   - Новые листы популяции создаются правее первого листа (не в конце книги).
+'   - При множественных частях новые листы добавляются цепочкой сразу за первым.
+'   - В ветке конфликта имён (есть BASE и уже есть Ч1) — удаляем BASE без создания
+'     временного листа (исключает коллизию имени).
+'
+' Напоминание (из 1.1.1):
+'   - Быстрый копирующий проход без AutoFilter/Copy/Paste; точная разметка блоков.
+'   - Контроль сумм «Сумма»: ΣИсточник vs ΣПриемник (логи).
+'   - Удаление колонки "Меппинг" на целевых листах.
+'   - Разбиение: по MAX_ROWS_PER_PART (данные с 2-й строки), до MAX_PARTS частей.
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.1.2"
+
+
+Private Const PROCESSED_PREFIX As String = "ЖП_обработанный_"
+Private Const LOG_SHEET As String      = "Логи"
+
+
+Private Const BASE_NAME As String   = "Популяция для тестирования"
+Private Const PART_SUFFIX As String = "_Ч"
+
+
+' Лимит данных на лист (без учёта шапки, которая идёт в строке 1)
+Private Const MAX_ROWS_PER_PART As Long = 1000000
+Private Const MAX_PARTS As Long         = 10
+
+
+' Быстрый режим форматов: переносим шапку, ширины и NumberFormat по столбцам.
+Private Const PRESERVE_CELL_FORMATS As Boolean = False
+
+
+Private currentStep As String
+Private stepT As Double
+
+
+' Контроль сумм
+Private gSrcSum As Double
+Private gDstSum As Double
+Private gBlockCount As Long
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Сформировать_Популяцию_Для_Тестирования()
+    Dim t0 As Double: t0 = Timer
+
+
+    Dim appCalc As XlCalculation
+    Dim scrUp As Boolean, evt As Boolean, alr As Boolean
+
+
+    On Error GoTo EH
+
+
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt   = Application.EnableEvents
+    alr   = Application.DisplayAlerts
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    gSrcSum = 0: gDstSum = 0: gBlockCount = 0
+
+
+    LogWrite NowStr() & vbTab & "Старт" & vbTab & _
+            "Сформировать_Популяцию_Для_Тестирования v" & MacroVersion & _
+            "; FastFormats=" & IIf(PRESERVE_CELL_FORMATS, "OFF (exact formats)", "ON (column formats)")
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    ' ---------- Источники ----------
+    StartStep "Поиск листов-источников ЖП_обработанный_*"
+    Dim srcSheets As Collection: Set srcSheets = GetProcessedSheets(wb, PROCESSED_PREFIX)
+    If srcSheets Is Nothing Or srcSheets.Count = 0 Then
+        LogWrite NowStr() & vbTab & "Внимание" & vbTab & "Листы '" & PROCESSED_PREFIX & "*' не найдены"
+        GoTo FinishOK
+    End If
+    LogWrite NowStr() & vbTab & "Найдено источников" & vbTab & srcSheets.Count
+    EndStep
+
+
+    ' ---------- Подсчёт строк ----------
+    StartStep "Подсчёт строк с меппингом 'Популяция для тестирования' (массовый)"
+    Dim totalRows As Long: totalRows = CountPopulationTotal(srcSheets)
+    LogWrite NowStr() & vbTab & "? Подсчёт" & vbTab & "Всего строк=" & totalRows
+    EndStep
+
+
+    ' ---------- Подготовка целевых листов ----------
+    StartStep "Подготовка целевых листов/частей (добавление справа от 1-го листа)"
+    Dim parts As Collection: Set parts = New Collection
+    PrepareParts wb, totalRows, parts
+    EndStep
+
+
+    ' ---------- Копирование данных ----------
+    StartStep "Копирование значений (прямое присваивание Range.Value)"
+    Dim copied As Long
+    Dim partIdx As Long: partIdx = 1
+    Dim destWs As Worksheet: Set destWs = parts(partIdx)
+    Dim destDataRow As Long: destDataRow = 2
+    Dim headerInitialized() As Boolean
+    Dim partsCount As Long: partsCount = parts.Count
+    If partsCount = 0 Then GoTo FinishOK
+    ReDim headerInitialized(1 To partsCount)
+
+
+    Dim i As Long
+    For i = 1 To srcSheets.Count
+        copied = copied + CopyFromSourceFast(srcSheets(i), destWs, destDataRow, parts, partIdx, headerInitialized)
+    Next i
+
+
+    LogWrite NowStr() & vbTab & "? Копирование" & vbTab & _
+            "Скопировано строк=" & copied & "; Блоков=" & gBlockCount
+    EndStep
+
+
+    ' ---------- Удаление "Меппинг" ----------
+    StartStep "Удаление колонки 'Меппинг' на целевых листах"
+    RemoveMappingColumnOnParts parts
+    EndStep
+
+
+FinishOK:
+    ' Контроль сумм
+    LogWrite NowStr() & vbTab & "Контроль сумм" & vbTab & _
+        "ΣИсточник=" & FormatNumber(gSrcSum, 2) & _
+        "; ΣПриемник=" & FormatNumber(gDstSum, 2) & _
+        "; Δ=" & FormatNumber(gSrcSum - gDstSum, 2)
+
+
+    LogWrite NowStr() & vbTab & "Готово" & vbTab & _
+            "Итоговых строк=" & copied & "; Частей=" & parts.Count & _
+            "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents   = evt
+    Application.DisplayAlerts  = alr
+    Application.Calculation    = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite NowStr() & vbTab & "Ошибка" & vbTab & _
+            "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'============================== СЧЁТ И ПОДГОТОВКА ==============================
+
+
+Private Function CountPopulationTotal(ByVal srcSheets As Collection) As Long
+    Dim i As Long, ws As Worksheet, cnt As Long, perSheet As Long
+    For i = 1 To srcSheets.Count
+        Set ws = srcSheets(i)
+        perSheet = CountOnSheetFast(ws, "Популяция для тестирования")
+        cnt = cnt + perSheet
+        LogWrite NowStr() & vbTab & "Подсчёт на " & ws.Name & vbTab & perSheet
+    Next i
+    CountPopulationTotal = cnt
+End Function
+
+
+Private Function CountOnSheetFast(ByVal ws As Worksheet, ByVal mapValue As String) As Long
+    On Error GoTo SafeExit
+    Dim cMap As Long: cMap = FindHeaderCol(ws, "Меппинг", 1)
+    If cMap = 0 Then Exit Function
+
+
+    Dim lastRow As Long: lastRow = LastDataRow2(ws)
+    If lastRow < 2 Then Exit Function
+
+
+    Dim arr As Variant
+    arr = ws.Range(ws.Cells(2, cMap), ws.Cells(lastRow, cMap)).Value2
+
+
+    Dim i As Long, m As Long: m = UBound(arr, 1)
+    For i = 1 To m
+        If SameMap(arr(i, 1), mapValue) Then CountOnSheetFast = CountOnSheetFast + 1
+    Next i
+SafeExit:
+End Function
+
+
+Private Sub PrepareParts(ByVal wb As Workbook, ByVal totalRows As Long, ByRef outParts As Collection)
+    Dim needParts As Long
+    If totalRows <= 0 Then
+        needParts = 1
+    Else
+        needParts = (totalRows \ MAX_ROWS_PER_PART)
+        If (totalRows Mod MAX_ROWS_PER_PART) > 0 Then needParts = needParts + 1
+        If needParts < 1 Then needParts = 1
+        If needParts > MAX_PARTS Then needParts = MAX_PARTS
+    End If
+
+
+    Dim baseWs As Worksheet, parts(1 To MAX_PARTS) As Worksheet
+    Dim haveBase As Boolean, i As Long
+    Dim anchor As Worksheet          ' куда вставлять новые листы: всегда правее первого
+    Set anchor = wb.Worksheets(1)
+
+
+    On Error Resume Next
+    Set baseWs = wb.Worksheets(BASE_NAME): haveBase = Not baseWs Is Nothing
+    For i = 1 To MAX_PARTS
+        Set parts(i) = wb.Worksheets(BASE_NAME & PART_SUFFIX & CStr(i))
+    Next i
+    On Error GoTo 0
+
+
+    If needParts = 1 Then
+        ' Оставляем один базовый лист без суффикса
+        If Not haveBase Then
+            If Not parts(1) Is Nothing Then
+                parts(1).Name = BASE_NAME
+                Set baseWs = parts(1)
+                Set parts(1) = Nothing
+                LogWrite NowStr() & vbTab & "Переименован лист" & vbTab & baseWs.Name
+            Else
+                Set baseWs = wb.Worksheets.Add(After:=anchor)
+                baseWs.Name = BASE_NAME
+                LogWrite NowStr() & vbTab & "Создан лист" & vbTab & baseWs.Name & " (вставлен после " & anchor.Name & ")"
+            End If
+        End If
+
+
+        ' Удаляем лишние части, если есть
+        For i = 1 To MAX_PARTS
+            If Not parts(i) Is Nothing Then
+                Application.DisplayAlerts = False: parts(i).Delete: Application.DisplayAlerts = True
+                Set parts(i) = Nothing
+            End If
+        Next i
+
+
+        ResetDestSheet baseWs
+        outParts.Add baseWs
+        LogWrite NowStr() & vbTab & "Готов целевой лист" & vbTab & BASE_NAME
+    Else
+        ' Нужно несколько частей: Ч1..ЧneedParts
+        If haveBase Then
+            If parts(1) Is Nothing Then
+                baseWs.Name = BASE_NAME & PART_SUFFIX & "1"
+                Set parts(1) = baseWs
+                LogWrite NowStr() & vbTab & "Переименован лист" & vbTab & parts(1).Name
+            Else
+                ' Ч1 уже есть — базовый просто удаляем
+                Application.DisplayAlerts = False: baseWs.Delete: Application.DisplayAlerts = True
+                LogWrite NowStr() & vbTab & "Удалён базовый лист (уже был Ч1)" & vbTab & BASE_NAME
+            End If
+            Set baseWs = Nothing
+        End If
+
+
+        ' Создать недостающие части после первого листа (цепочкой)
+        Dim lastCreated As Worksheet
+        Set lastCreated = anchor
+        For i = 1 To needParts
+            If parts(i) Is Nothing Then
+                Set parts(i) = wb.Worksheets.Add(After:=lastCreated)
+                parts(i).Name = BASE_NAME & PART_SUFFIX & CStr(i)
+                Set lastCreated = parts(i)
+                LogWrite NowStr() & vbTab & "Создан лист" & vbTab & parts(i).Name & " (вставлен после " & lastCreated.Previous.Name & ")"
+            Else
+                ' если часть уже существует, то для следующего нового листа якорь остаётся прежним
+                ' (только новые листы гарантированно появляются правее первого)
+            End If
+            ResetDestSheet parts(i)
+            outParts.Add parts(i)
+            LogWrite NowStr() & vbTab & "Готов целевой лист" & vbTab & parts(i).Name
+        Next i
+
+
+        ' Удалить лишние старые части > needParts
+        For i = needParts + 1 To MAX_PARTS
+            If Not parts(i) Is Nothing Then
+                Application.DisplayAlerts = False: parts(i).Delete: Application.DisplayAlerts = True
+                Set parts(i) = Nothing
+            End If
+        Next i
+    End If
+End Sub
+
+
+Private Sub ResetDestSheet(ByVal ws As Worksheet)
+    On Error Resume Next
+    ws.AutoFilterMode = False
+    ws.Cells.Clear
+    ws.Cells.Validation.Delete
+    ws.Cells.FormatConditions.Delete
+    ws.Rows.RowHeight = ws.StandardHeight
+    ws.Columns.ColumnWidth = 8.43
+    On Error GoTo 0
+end Sub
+
+
+'============================== КОПИРОВАНИЕ ДАННЫХ =============================
+
+
+Private Function CopyFromSourceFast( _
+    ByVal wsSrc As Worksheet, _
+    ByRef destWs As Worksheet, _
+    ByRef destDataRow As Long, _
+    ByVal parts As Collection, _
+    ByRef partIdx As Long, _
+    ByRef headerInitialized() As Boolean) As Long
+
+
+    On Error GoTo SafeExit
+
+
+    Dim cMap As Long: cMap = FindHeaderCol(wsSrc, "Меппинг", 1)
+    If cMap = 0 Then
+        LogWrite NowStr() & vbTab & "Пропуск (нет 'Меппинг')" & vbTab & wsSrc.Name
+        Exit Function
+    End If
+
+
+    Dim cSum As Long
+    cSum = FindHeaderSyn(wsSrc, Array("Сумма", " сумма", "сумма "))
+    If cSum = 0 Then
+        LogWrite NowStr() & vbTab & "Пропуск (нет 'Сумма')" & vbTab & wsSrc.Name
+        Exit Function
+    End If
+
+
+    Dim lastCol As Long: lastCol = wsSrc.Cells(1, wsSrc.Columns.Count).End(xlToLeft).Column
+    Dim lastRow As Long: lastRow = LastDataRow2(wsSrc)
+    If lastRow < 2 Then Exit Function
+
+
+    ' Шапка для текущей части — один раз
+    If Not headerInitialized(partIdx) Then
+        CopyHeaderFormatsAndWidths wsSrc, destWs, lastCol, cMap
+        headerInitialized(partIdx) = True
+    End If
+
+
+    ' Быстрый проход по колонке "Меппинг"
+    Dim arr As Variant
+    arr = wsSrc.Range(wsSrc.Cells(2, cMap), wsSrc.Cells(lastRow, cMap)).Value2
+
+
+    Dim m As Long: m = UBound(arr, 1)
+    Dim i As Long
+    Dim inBlock As Boolean
+    Dim blockStartAbs As Long ' абсолютная строка листа ИСТОЧНИКА (>=2)
+
+
+    For i = 1 To m
+        If SameMap(arr(i, 1), "Популяция для тестирования") Then
+            If Not inBlock Then
+                inBlock = True
+                blockStartAbs = i + 1            ' i=1 -> строка 2
+            End If
+        Else
+            If inBlock Then
+                inBlock = False
+                CopyFromSourceFast = CopyFromSourceFast + _
+                    CopyBlockWithSplit(wsSrc, blockStartAbs, (i + 1), lastCol, destWs, destDataRow, parts, partIdx, headerInitialized, cMap, cSum)
+            End If
+        End If
+    Next i
+
+
+    If inBlock Then
+        CopyFromSourceFast = CopyFromSourceFast + _
+            CopyBlockWithSplit(wsSrc, blockStartAbs, (m + 2), lastCol, destWs, destDataRow, parts, partIdx, headerInitialized, cMap, cSum)
+    End If
+
+
+    LogWrite NowStr() & vbTab & "Источник " & wsSrc.Name & vbTab & "Скопировано=" & CopyFromSourceFast
+SafeExit:
+End Function
+
+
+Private Function CopyBlockWithSplit( _
+    ByVal wsSrc As Worksheet, _
+    ByVal startAbsRow As Long, _
+    ByVal endAbsRowPlus1 As Long, _
+    ByVal lastCol As Long, _
+    ByRef destWs As Worksheet, _
+    ByRef destDataRow As Long, _
+    ByVal parts As Collection, _
+    ByRef partIdx As Long, _
+    ByRef headerInitialized() As Boolean, _
+    ByVal cMap As Long, _
+    ByVal cSum As Long) As Long
+
+
+    Dim totalRows As Long
+    totalRows = endAbsRowPlus1 - startAbsRow
+    If totalRows <= 0 Then Exit Function
+
+
+    Dim leftRows As Long: leftRows = totalRows
+    Dim take As Long, cap As Long
+    Dim srcTop As Long: srcTop = startAbsRow
+
+
+    Do While leftRows > 0
+        ' вместимость данных на текущей части (строка 1 — шапка)
+        cap = MAX_ROWS_PER_PART - (destDataRow - 2)
+        If cap <= 0 Then
+            If partIdx >= parts.Count Then
+                LogWrite NowStr() & vbTab & "Внимание" & vbTab & _
+                    "Превышен лимит частей (" & MAX_PARTS & "). Оставшиеся строки проигнорированы."
+                Exit Do
+            End If
+            partIdx = partIdx + 1
+            Set destWs = parts(partIdx)
+            destDataRow = 2
+            If Not headerInitialized(partIdx) Then
+                CopyHeaderFormatsAndWidths wsSrc, destWs, lastCol, cMap
+                headerInitialized(partIdx) = True
+            End If
+            cap = MAX_ROWS_PER_PART
+        End If
+
+
+        If leftRows > cap Then take = cap Else take = leftRows
+
+
+        ' Копируем значения целым блоком
+        With wsSrc
+            destWs.Cells(destDataRow, 1).Resize(take, lastCol).Value = _
+                .Cells(srcTop, 1).Resize(take, lastCol).Value
+        End With
+
+
+        ' Контроль сумм на лету
+        gSrcSum = gSrcSum + SafeSumRange(wsSrc.Cells(srcTop, cSum).Resize(take, 1))
+        gDstSum = gDstSum + SafeSumRange(destWs.Cells(destDataRow, cSum).Resize(take, 1))
+
+
+        CopyBlockWithSplit = CopyBlockWithSplit + take
+        gBlockCount = gBlockCount + 1
+
+
+        destDataRow = destDataRow + take
+        leftRows = leftRows - take
+        srcTop = srcTop + take
+    Loop
+End Function
+
+
+'============================== ФОРМАТЫ/ШИРИНЫ =================================
+
+
+Private Sub CopyHeaderFormatsAndWidths(ByVal wsSrc As Worksheet, ByVal wsDst As Worksheet, ByVal lastCol As Long, ByVal cMap As Long)
+    ' 1) Шапка с форматами
+    Dim srcHdr As Range: Set srcHdr = wsSrc.Range(wsSrc.Cells(1, 1), wsSrc.Cells(1, lastCol))
+    srcHdr.Copy
+    wsDst.Cells(1, 1).PasteSpecial xlPasteAll
+
+
+    ' 2) Ширины столбцов
+    Dim j As Long
+    For j = 1 To lastCol
+        wsDst.Columns(j).ColumnWidth = wsSrc.Columns(j).ColumnWidth
+    Next j
+
+
+    ' 3) NumberFormat по столбцам
+    For j = 1 To lastCol
+        wsDst.Columns(j).NumberFormatLocal = wsSrc.Columns(j).NumberFormatLocal
+    Next j
+
+
+    ' 4) Опционально построчные форматы тела
+    If PRESERVE_CELL_FORMATS Then
+        Dim lastRow As Long: lastRow = LastDataRow2(wsSrc)
+        If lastRow >= 2 Then
+            wsSrc.Range(wsSrc.Cells(2, 1), wsSrc.Cells(lastRow, lastCol)).Copy
+            wsDst.Cells(2, 1).PasteSpecial xlPasteFormats
+        End If
+    End If
+End Sub
+
+
+Private Sub RemoveMappingColumnOnParts(ByVal parts As Collection)
+    Dim i As Long, ws As Worksheet, cMap As Long, removed As Long
+    For i = 1 To parts.Count
+        Set ws = parts(i)
+        cMap = FindHeaderCol(ws, "Меппинг", 1)
+        If cMap > 0 Then
+            ws.Columns(cMap).Delete
+            removed = removed + 1
+            LogWrite NowStr() & vbTab & "Удалён 'Меппинг' на" & vbTab & ws.Name
+        End If
+    Next i
+    LogWrite NowStr() & vbTab & "? Удаление колонки" & vbTab & "Листов обработано=" & removed
+End Sub
+
+
+'============================== ХЕЛПЕРЫ ========================================
+
+
+Private Function SameMap(ByVal v As Variant, ByVal target As String) As Boolean
+    Dim s As String
+    s = CStr(v)
+    s = Replace$(s, Chr$(160), " ")
+    s = Trim$(s)
+    If LenB(s) = 0 Then Exit Function
+    SameMap = (StrComp(s, target, vbTextCompare) = 0)
+End Function
+
+
+Private Function GetProcessedSheets(ByVal wb As Workbook, ByVal prefix As String) As Collection
+    Dim col As New Collection, sh As Worksheet, idx As Long, nm As String
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If Left$(nm, Len(prefix)) = prefix Then
+            idx = Val(Mid$(nm, Len(prefix) + 1))
+            If idx > 0 Then InsertByIndex col, sh, idx
+        End If
+    Next sh
+    Set GetProcessedSheets = col
+End Function
+
+
+Private Sub InsertByIndex(ByRef coll As Collection, ByVal ws As Worksheet, ByVal idx As Long)
+    Dim i As Long, added As Boolean
+    added = False
+    For i = 1 To coll.Count
+        If Val(Mid$(coll(i).Name, Len(PROCESSED_PREFIX) + 1)) > idx Then
+            coll.Add ws, , i
+            added = True
+            Exit Sub
+        End If
+    Next i
+    If Not added Then coll.Add ws
+End Sub
+
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, ByVal hdrRow As Long) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If CStr(ws.Cells(hdrRow, c).Value) = headerText Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+End Function
+
+
+Private Function FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant) As Long
+    Dim lastCol As Long, c As Long, head As String, i As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        head = NormalizeHeaderText(CStr(ws.Cells(1, c).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                If head = NormalizeHeaderText(CStr(syns(i))) Then
+                    FindHeaderSyn = c
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next c
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = s
+End Function
+
+
+Private Function LastDataRow2(ByVal ws As Worksheet) As Long
+    Dim lastCol As Long, c As Long, lr As Long, l As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        l = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If l > lr Then lr = l
+    Next c
+    If lr < 2 Then lr = 2
+    LastDataRow2 = lr
+End Function
+
+
+Private Function SafeSumRange(ByVal rng As Range) As Double
+    On Error GoTo Fallback
+    SafeSumRange = WorksheetFunction.Sum(rng)
+    Exit Function
+Fallback:
+    SafeSumRange = 0#
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub LogWrite(ByVal msg: String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function NowStr() As String
+    NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

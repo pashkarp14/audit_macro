@@ -1,0 +1,271 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Лист:      7. Праздники
+' Модуль:    Sheet_7_Prazdniki_Trigger
+' Версия:    1.1.0  (22.09.2025)
+'
+' Что нового в 1.1.0:
+'   - Debounce: защита от повторного пуска в пределах 0.5 сек (Timer).
+'   - ОДНОКРАТНЫЙ вызов пайплайна: все условия (A1/A2/A3, A4, B) сводятся в флаг needRun;
+'     если он True — вызываем РАНДОМ один раз.
+'   - Улучшен разбор многодиапазонных Target (Areas) и ранний выход.
+'   - Расширено логирование (причина срабатывания).
+'
+' Что делает:
+'   Отслеживает изменения строго в заданных ячейках относительно двух якорей:
+'   [A] Якорь в кол.5:  "Настройки выборки >>>"
+'       - Изменились (row+1, col+1) ИЛИ (row+2, col+1) ИЛИ (row+3, col+1) -> РАНДОМ
+'       - Изменилась  (row+4, col+1)                                      -> РАНДОМ
+'   [B] Якорь в кол.2:  "Выборка для тестирования (в рублях) >>>"
+'       - Изменилась  (row+2, col+1)                                      -> РАНДОМ
+'
+' Оптимизация:
+'   - Ранний выход по колонкам (6 для A, 3 для B) и по размерам изменения.
+'   - Защита от рекурсии (isInsideHandler) + debounce (lastFireTick).
+'
+' Логирование:
+'   - Подробные логи на лист "Логи". Приватные имена без конфликтов.
+'========================================================================================
+
+
+Private Const MODULE_VERSION As String = "1.1.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+' --- Debounce (сек) ---
+Private Const DEBOUNCE_SEC As Double = 0.5
+
+
+Private isInsideHandler As Boolean
+Private lastFireTick As Double
+
+
+Private Sub Worksheet_Change(ByVal target As Range)
+    On Error GoTo Err_Handler
+
+
+    If target Is Nothing Then Exit Sub
+    If target.CountLarge > 100000 Then Exit Sub      ' массовые заливки отбрасываем
+    If isInsideHandler Then Exit Sub                 ' рекурсия
+
+
+    ' Ранний фильтр по столбцам: 6 (F) — блок A; 3 (C) — блок B
+    Dim inCol6 As Boolean, inCol3 As Boolean
+    inCol6 = Not (Intersect(target, Me.Columns(6)) Is Nothing)
+    inCol3 = Not (Intersect(target, Me.Columns(3)) Is Nothing)
+    If Not inCol6 And Not inCol3 Then Exit Sub
+
+
+    ' Debounce: внутри окна DEBOUNCE_SEC повторно не запускаем
+    Dim nowT As Double: nowT = Timer
+    If lastFireTick > 0 Then
+        Dim dt As Double
+        dt = nowT - lastFireTick
+        If dt < 0 Then dt = dt + 24 * 60 * 60   ' защита на перезагрузку таймера в полночь
+        If dt < DEBOUNCE_SEC Then
+            LogWrite_Private "Debounce: повторное событие проигнорировано (" & Format$(dt, "0.00") & " c)"
+            Exit Sub
+        End If
+    End If
+
+
+    isInsideHandler = True
+    Application.EnableEvents = False
+
+
+    ' Лог
+    LogWrite_Private "7. Праздники v" & MODULE_VERSION & " — Change: " & SafeAddr(target)
+
+
+    ' Найдём якоря
+    Dim needRun As Boolean
+    needRun = False
+
+
+    ' ---------------------------- [A] якорь в кол.5 ----------------------------
+    If inCol6 Then
+        Dim anchorA As Range
+        Set anchorA = FindAnchorInColumn(ws:=Me, anchorText:="Настройки выборки >>>", searchColumn:=5)
+
+
+        If Not anchorA Is Nothing Then
+            Dim cA1 As Range, cA2 As Range, cA3 As Range, cA4 As Range
+            Set cA1 = Me.Cells(anchorA.Row + 1, anchorA.Column + 1)   ' (r+1, c+1)
+            Set cA2 = Me.Cells(anchorA.Row + 2, anchorA.Column + 1)   ' (r+2, c+1)
+            Set cA3 = Me.Cells(anchorA.Row + 3, anchorA.Column + 1)   ' (r+3, c+1)
+            Set cA4 = Me.Cells(anchorA.Row + 4, anchorA.Column + 1)   ' (r+4, c+1)
+
+
+            Dim grpA1to3 As Range, grpAall As Range
+            Set grpA1to3 = UnionSafe(cA1, cA2, cA3, Nothing)
+            Set grpAall = UnionSafe(grpA1to3, cA4, Nothing, Nothing)
+
+
+            If Not grpAall Is Nothing Then
+                Dim hitA As Range
+                Set hitA = Intersect(target, grpAall)
+                If Not hitA Is Nothing Then
+                    needRun = True
+                    If Not (Intersect(target, grpA1to3) Is Nothing) Then
+                        LogWrite_Private "Причина запуска: блок A(1) — " & Intersect(target, grpA1to3).Address(0, 0)
+                    ElseIf Not (Intersect(target, cA4) Is Nothing) Then
+                        LogWrite_Private "Причина запуска: блок A(2) — " & cA4.Address(0, 0)
+                    Else
+                        LogWrite_Private "Причина запуска: блок A — пересечение не детализировано"
+                    End If
+                End If
+            End If
+        Else
+            LogWrite_Private "Якорь A не найден в кол.5: 'Настройки выборки >>>'"
+        End If
+    End If
+
+
+    ' ---------------------------- [B] якорь в кол.2 ----------------------------
+    If inCol3 Then
+        Dim anchorB As Range
+        Set anchorB = FindAnchorInColumn(ws:=Me, anchorText:="Выборка для тестирования (в рублях) >>>", searchColumn:=2)
+
+
+        If Not anchorB Is Nothing Then
+            Dim cB As Range
+            Set cB = Me.Cells(anchorB.Row + 2, anchorB.Column + 1)    ' (r+2, c+1)
+            If Not Intersect(target, cB) Is Nothing Then
+                needRun = True
+                LogWrite_Private "Причина запуска: блок B — " & cB.Address(0, 0)
+            End If
+        Else
+            LogWrite_Private "Якорь B не найден в кол.2: 'Выборка для тестирования (в рублях) >>>'"
+        End If
+    End If
+
+
+    ' ---------------------------- ОДИН вызов пайплайна -------------------------
+    If needRun Then
+        lastFireTick = nowT
+        ' ВАЖНО: вызываем единожды
+        Call Мастер_РО_по_вводу_доходов
+    Else
+        LogWrite_Private "Условия не выполнены — запуск не требуется"
+    End If
+
+
+Exit_Handler:
+    Application.EnableEvents = True
+    isInsideHandler = False
+    Exit Sub
+
+
+Err_Handler:
+    LogWrite_Private "ERR Worksheet_Change: " & Err.Number & " — " & Err.Description
+    Resume Exit_Handler
+End Sub
+
+
+'=========================
+' Helpers — ТОЛЬКО ДЛЯ ЭТОГО ЛИСТА
+'=========================
+Private Function FindAnchorInColumn(ByVal ws As Worksheet, ByVal anchorText As String, ByVal searchColumn As Long) As Range
+    On Error GoTo Err_Handler
+
+
+    Dim rngCol As Range
+    Set rngCol = ws.Columns(searchColumn)
+
+
+    Dim f As Range
+    Set f = rngCol.Find(What:=anchorText, _
+                        After:=rngCol.Cells(rngCol.rows.count, 1), _
+                        LookIn:=xlValues, _
+                        LookAt:=xlWhole, _
+                        SearchOrder:=xlByRows, _
+                        SearchDirection:=xlNext, _
+                        MatchCase:=False)
+
+
+    If Not f Is Nothing Then
+        Set FindAnchorInColumn = f
+        LogWrite_Private "Найден якорь '" & anchorText & "' в " & f.Address(0, 0)
+    Else
+        Set FindAnchorInColumn = Nothing
+    End If
+    Exit Function
+
+
+Err_Handler:
+    LogWrite_Private "ERR FindAnchorInColumn '" & anchorText & "': " & Err.Number & " — " & Err.Description
+    Set FindAnchorInColumn = Nothing
+End Function
+
+
+Private Function UnionSafe(ByVal r1 As Range, ByVal r2 As Range, Optional ByVal r3 As Range = Nothing, Optional ByVal r4 As Range = Nothing) As Range
+    On Error GoTo Err_Handler
+    Dim tmp As Range
+    If Not r1 Is Nothing Then Set tmp = r1
+    If Not r2 Is Nothing Then If tmp Is Nothing Then Set tmp = r2 Else Set tmp = Union(tmp, r2)
+    If Not r3 Is Nothing Then If tmp Is Nothing Then Set tmp = r3 Else Set tmp = Union(tmp, r3)
+    If Not r4 Is Nothing Then If tmp Is Nothing Then Set tmp = r4 Else Set tmp = Union(tmp, r4)
+    Set UnionSafe = tmp
+    Exit Function
+Err_Handler:
+    LogWrite_Private "ERR UnionSafe: " & Err.Number & " — " & Err.Description
+    Set UnionSafe = Nothing
+End Function
+
+
+Private Function SafeAddr(ByVal r As Range) As String
+    On Error Resume Next
+    If r Is Nothing Then
+        SafeAddr = "(пусто)"
+    ElseIf r.Areas.count = 1 Then
+        SafeAddr = r.Address(0, 0)
+    Else
+        SafeAddr = "Areas=" & r.Areas.count & " [" & r.Areas(1).Address(0, 0) & " ...]"
+    End If
+End Function
+
+
+'-------------------------------
+' ЛОКАЛЬНОЕ ПРИВАТНОЕ ЛОГИРОВАНИЕ
+'-------------------------------
+Private Sub LogWrite_Private(ByVal msg As String)
+    On Error GoTo SilentFail
+
+
+    Dim prevEvents As Boolean
+    prevEvents = Application.EnableEvents
+    Application.EnableEvents = False
+
+
+    Dim wsLog As Worksheet
+    On Error Resume Next
+    Set wsLog = ThisWorkbook.Worksheets(LOG_SHEET)
+    On Error GoTo 0
+
+
+    If wsLog Is Nothing Then
+        Set wsLog = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.count))
+        wsLog.name = LOG_SHEET
+        wsLog.Range("A1").Value = "Дата/Время"
+        wsLog.Range("B1").Value = "Сообщение"
+    End If
+
+
+    Dim nextRow As Long
+    nextRow = wsLog.Cells(wsLog.rows.count, 1).End(xlUp).Row + 1
+
+
+    wsLog.Cells(nextRow, 1).Value = Now
+    wsLog.Cells(nextRow, 2).Value = msg
+
+
+    Application.EnableEvents = prevEvents
+    Exit Sub
+
+
+SilentFail:
+    On Error Resume Next
+    Application.EnableEvents = True
+End Sub

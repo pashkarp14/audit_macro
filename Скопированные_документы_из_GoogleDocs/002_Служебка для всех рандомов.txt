@@ -1,0 +1,126 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' modRandCore — детерминированный PRNG + перетасовка и выбор без повторов
+' Версия: 1.0 (22.09.2025)
+'
+' Использование:
+'   Dim pick() As Long
+'   pick = RC_RandPick(pool, needCount, seed)
+'   ' pool() — массив индексов (любые Long), 1- или 0- или LBound<>1 — поддерживается
+'   ' seed   — любое целое; 0 и отрицательные нормализуются к 1..PM_M-1
+'
+' Или:
+'   RC_ShuffleFY arr, UBound(arr) - LBound(arr) + 1, seed  ' перетасовать копию arr()
+'
+' В модуле НЕТ ссылок на VBA.Rnd — воспроизводимость гарантирована.
+'===============================================================================
+
+
+Public Const RANDCORE_VERSION As String = "1.0"
+
+
+' Park–Miller minimal standard (31-bit)
+Private Const PM_A As Long = 16807
+Private Const PM_M As Long = 2147483647
+Private Const PM_Q As Long = 127773     ' PM_M \ PM_A
+Private Const PM_R As Long = 2836       ' PM_M Mod PM_A
+
+
+' --- Служебное: проверка, выделен ли массив
+Public Function RC_IsAllocated(ByRef arr As Variant) As Boolean
+    On Error GoTo NA
+    If IsArray(arr) Then
+        Dim lb As Long, ub As Long
+        lb = LBound(arr): ub = UBound(arr)
+        RC_IsAllocated = (ub >= lb)
+    End If
+    Exit Function
+NA:
+    RC_IsAllocated = False
+End Function
+
+
+' --- Нормализация seed в 1..PM_M-1
+Public Function RC_NormalizeSeed(ByVal seed As Long) As Long
+    If seed <= 0 Then seed = -seed
+    seed = seed Mod PM_M
+    If seed = 0 Then seed = 1
+    RC_NormalizeSeed = seed
+End Function
+
+
+' --- Следующее состояние (без переполнений)
+Public Function RC_PM_Next(ByVal seed As Long) As Long
+    Dim hi As Long, lo As Long, test As Long
+    hi = seed \ PM_Q
+    lo = seed - hi * PM_Q
+    test = PM_A * lo - PM_R * hi
+    If test <= 0 Then test = test + PM_M
+    RC_PM_Next = test
+End Function
+
+
+' --- Следующее случайное число (0,1), меняет seed по ссылке
+Public Function RC_PM_Next01(ByRef seed As Long) As Double
+    seed = RC_PM_Next(seed)
+    RC_PM_Next01 = seed / PM_M
+End Function
+
+
+' --- Детерминированная перетасовка Fisher–Yates (копия массива)
+Public Sub RC_ShuffleFY(ByRef idx() As Long, ByVal count As Long, ByVal baseSeed As Long)
+    Dim s As Long: s = RC_NormalizeSeed(baseSeed)
+    Dim i As Long, j As Long, t As Long, u As Double
+    For i = count To 2 Step -1
+        u = RC_PM_Next01(s)
+        j = CLng(Int(u * i)) + 1   ' 1..i
+        t = idx(i): idx(i) = idx(j): idx(j) = t
+    Next i
+End Sub
+
+
+' --- Получить случайные N элементов из srcIdx() (без повторов), детерминированно от seed
+Public Function RC_RandPick(ByRef srcIdx() As Long, ByVal needCount As Long, ByVal seed As Long) As Long()
+    Dim outDummy() As Long
+    If Not RC_IsAllocated(srcIdx) Then RC_RandPick = outDummy: Exit Function
+    If needCount <= 0 Then RC_RandPick = outDummy: Exit Function
+
+
+    Dim lb As Long, ub As Long, srcCount As Long
+    lb = LBound(srcIdx): ub = UBound(srcIdx): srcCount = ub - lb + 1
+    If srcCount <= 0 Then RC_RandPick = outDummy: Exit Function
+
+
+    Dim perm() As Long, i As Long, takeN As Long
+    ReDim perm(1 To srcCount)
+    For i = 1 To srcCount
+        perm(i) = srcIdx(lb + i - 1)
+    Next i
+
+
+    RC_ShuffleFY perm, srcCount, seed
+
+
+    takeN = IIf(needCount < srcCount, needCount, srcCount)
+    ReDim outDummy(1 To takeN)
+    For i = 1 To takeN
+        outDummy(i) = perm(i)
+    Next i
+
+
+    RC_RandPick = outDummy
+End Function
+
+
+' --- Сгенерировать полную перестановку 1..N (иногда удобно)
+Public Function RC_RandPermN(ByVal n As Long, ByVal seed As Long) As Long()
+    Dim outDummy() As Long
+    If n <= 0 Then RC_RandPermN = outDummy: Exit Function
+    ReDim outDummy(1 To n)
+    Dim i As Long
+    For i = 1 To n: outDummy(i) = i: Next i
+    RC_ShuffleFY outDummy, n, seed
+    RC_RandPermN = outDummy
+End Function

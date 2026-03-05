@@ -1,0 +1,293 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Лист:     2. Проводки к исключению  — триггеры
+' Версия:   1.1.0  (06.10.2025)
+'
+' Новое в 1.1.0:
+'   - Добавлен флаг включения/выключения триггера (имя книги TRG_EXCL_ENABLED).
+'   - События мгновенно выходят, если триггер выключен (минимум оверхеда).
+'   - Подробные логи при смене состояния (через кнопки из мод. modExclTrigger_Toggle).
+'
+' Логика без изменений:
+'   - SelectionChange: запоминаем старый меппинг выбранной ячейки в столбце "Меппинг".
+'   - Change: при правке "Меппинг" — валидация, обновление "Обоснование", вызов SyncMappingChange_One.
+'   - Поиск колонок по шапке рядом с якорем "Анализ проводок к исключению>>>".
+'   - Замены в ЖП — по строгому тексту "Проводка" и совпадению канонизованного старого меппинга.
+'
+' Замечание:
+'   - Внешние функции: AllowedMappings, CanonMapKeyCommon, MapToReason, SyncMappingChange_One
+'     — как и прежде, не трогаем.
+'===============================================================================
+
+
+Private Const LOG_SHEET  As String = "Логи"
+Private Const ANCHOR_COL As Long = 2
+Private Const ANCHOR_TEXT As String = "Анализ проводок к исключению>>>"
+Private Const TOTAL_TEXT  As String = "Итого"
+
+
+' Имя книги для хранения состояния тумблера
+Private Const TRG_NAME_ENABLED As String = "TRG_EXCL_ENABLED"
+
+
+Private prevMapValue As String
+Private prevMapAddress As String
+
+
+'============================== С О Б Ы Т И Я ==================================
+
+
+Private Sub Worksheet_SelectionChange(ByVal target As Excel.Range)
+    On Error GoTo SafeExit
+
+
+    ' >>> Если триггер выключен — выходим мгновенно
+    If Not TRG_IsEnabled() Then
+        prevMapValue = vbNullString
+        prevMapAddress = vbNullString
+        Exit Sub
+    End If
+
+
+    Dim cMap As Long
+    Dim cJust As Long
+    Dim hdrRow As Long
+
+
+    If Not ResolveHeader(Me, hdrRow, cMap, cJust) Then
+        Exit Sub
+    End If
+
+
+    If Not Intersect(target, Me.Columns(cMap)) Is Nothing Then
+        If target.Cells.CountLarge = 1 Then
+            prevMapValue = CStr(target.Value)
+            prevMapAddress = target.Address(False, False)
+        Else
+            prevMapValue = vbNullString
+            prevMapAddress = vbNullString
+        End If
+    Else
+        prevMapValue = vbNullString
+        prevMapAddress = vbNullString
+    End If
+
+
+SafeExit:
+End Sub
+
+
+Private Sub Worksheet_Change(ByVal target As Excel.Range)
+    On Error GoTo EH
+
+
+    ' >>> Если триггер выключен — не вмешиваемся
+    If Not TRG_IsEnabled() Then
+        Exit Sub
+    End If
+
+
+    Dim hdrRow As Long
+    Dim cMap As Long
+    Dim cJust As Long
+
+
+    If Not ResolveHeader(Me, hdrRow, cMap, cJust) Then
+        Exit Sub
+    End If
+
+
+    Dim inter As Range
+    Set inter = Intersect(target, Me.Columns(cMap))
+    If inter Is Nothing Then
+        Exit Sub
+    End If
+
+
+    Application.EnableEvents = False
+
+
+    Dim cell As Range
+    For Each cell In inter.Cells
+        Dim newMap As String
+        newMap = CStr(cell.Value)
+
+
+        Dim oldMap As String
+        If prevMapAddress = cell.Address(False, False) Then
+            oldMap = prevMapValue
+        Else
+            ' Мультиселект/вставка — старое считаем пустым; валидируем лишь новое
+            oldMap = vbNullString
+        End If
+
+
+        ' Программная валидация сверх DataValidation
+        If Not IsAllowedMapping(newMap) Then
+            MsgBox "Недопустимое значение меппинга. Выберите из списка.", vbExclamation, "Меппинг"
+            Application.Undo
+            GoTo NextCell
+        End If
+
+
+        ' Обновить "Обоснование"
+        Me.Cells(cell.Row, cJust).Value = MapToReason(newMap)
+
+
+        ' Проводка для синхронизации
+        Dim cProv As Long
+        cProv = FindHeaderOnRow(Me, hdrRow, "Проводка")
+
+
+        Dim provText As String
+        provText = CStr(Me.Cells(cell.Row, cProv).Value)
+
+
+        If LenB(provText) > 0 Then
+            Call SyncMappingChange_One(provText, oldMap, newMap)
+        End If
+
+
+NextCell:
+    Next cell
+
+
+SafeExit:
+    Application.EnableEvents = True
+    Exit Sub
+
+
+EH:
+    LogWrite "TRIGGER ERROR: " & Err.Number & " — " & Err.Description
+    Resume SafeExit
+End Sub
+
+
+'============================== Вспомогательные ================================
+
+
+Private Function TRG_IsEnabled() As Boolean
+    On Error GoTo Fallback
+    Dim nm As Name
+    Set nm = ThisWorkbook.Names(TRG_NAME_ENABLED)
+    If nm Is Nothing Then
+        TRG_IsEnabled = True
+        Exit Function
+    End If
+    ' Имя хранит формулу вида =TRUE / =FALSE
+    TRG_IsEnabled = CBool(Evaluate(nm.RefersTo))
+    Exit Function
+Fallback:
+    ' По умолчанию — включено
+    TRG_IsEnabled = True
+End Function
+
+
+' --- Остальные хелперы из исходной версии ---
+
+
+Private Function ResolveHeader(ByVal ws As Worksheet, ByRef hdrRow As Long, ByRef cMap As Long, ByRef cJust As Long) As Boolean
+    Dim anchorRow As Long
+    anchorRow = FindFirstInColumnExact(ws, ANCHOR_COL, ANCHOR_TEXT)
+    If anchorRow = 0 Then
+        Exit Function
+    End If
+
+
+    hdrRow = anchorRow + 1
+    cMap = FindHeaderOnRow(ws, hdrRow, "Меппинг")
+    cJust = FindHeaderOnRow(ws, hdrRow, "Обоснование к исключению")
+
+
+    If cMap = 0 Or cJust = 0 Then
+        Exit Function
+    End If
+
+
+    ResolveHeader = True
+End Function
+
+
+Private Function FindHeaderOnRow(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headerText As String) As Long
+    Dim lastCol As Long
+    Dim j As Long
+
+
+    lastCol = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        If CStr(ws.Cells(rowNum, j).Value) = headerText Then
+            FindHeaderOnRow = j
+            Exit Function
+        End If
+    Next j
+End Function
+
+
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range
+    Dim f As Range
+
+
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+
+
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function IsAllowedMapping(ByVal mapDisp As String) As Boolean
+    Dim arr As Variant
+    arr = AllowedMappings()
+
+
+    Dim i As Long
+    Dim k As String
+    Dim t As String
+
+
+    t = CanonMapKeyCommon(mapDisp)
+
+
+    For i = LBound(arr) To UBound(arr)
+        k = CanonMapKeyCommon(CStr(arr(i)))
+        If k = t Then
+            IsAllowedMapping = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+' Логи (локальные)
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+
+
+    Dim ws As Worksheet
+    Dim r As Long
+
+
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+
+
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Exclusions Trigger v1.1.0"
+    ws.Cells(r, 3).Value = msg
+End Sub

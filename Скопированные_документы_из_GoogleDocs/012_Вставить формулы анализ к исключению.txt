@@ -1,0 +1,239 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Модуль:    modExclusions_Formulas
+' Версия:    1.1.0  (16.09.2025)
+'
+' Что нового в 1.1.0:
+'   - Формулы теперь С ЯВНЫМ УКАЗАНИЕМ ЛИСТА '2. Проводки к исключению'
+'     (раньше ссылки были относительные). Это исключает подтягивание данных
+'     не с того листа.
+'   - Дополнительные логи о том, какие диапазоны использованы в формулах.
+'
+' Назначение:
+'   Найти на листе "2. Проводки к исключению" в колонке B ячейку "Всего проводок"
+'   и поставить три формулы справа (и ниже), с нужным форматированием.
+'
+' Формулы (только по текущему листу "2. Проводки к исключению"):
+'   1) =СУММ(<Сумма>)/1000
+'   2) =СУММЕСЛИ(<Меппинг>;"<>Популяция для тестирования";<Сумма>)
+'   3) =СУММЕСЛИ(<Меппинг>;"Популяция для тестирования";<Сумма>)
+'
+' Формат чисел: "# ##0;-# ##0;-"
+' Логи: лист "Логи"
+'===============================================================================
+
+
+Private Const MODULE_VERSION As String = "1.1.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+Private Const DST_SHEET   As String = "2. Проводки к исключению"
+Private Const ANCHOR_COL  As Long = 2
+Private Const ANCHOR_TEXT As String = "Всего проводок"
+
+
+Private Const BLOCK_ANCHOR_TEXT As String = "Анализ проводок к исключению>>>"
+Private Const TOTAL_TEXT        As String = "Итого"
+Private Const NUM_FMT           As String = "# ##0;-# ##0;-"
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Вставить_Формулы_Итогов()
+    Dim t0 As Double: t0 = Timer
+    Dim ev As Boolean, su As Boolean, al As Boolean, calc As XlCalculation
+    On Error GoTo EH
+
+
+    ev = Application.EnableEvents
+    su = Application.ScreenUpdating
+    al = Application.DisplayAlerts
+    calc = Application.Calculation
+
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim ws As Worksheet: Set ws = wb.Worksheets(DST_SHEET)
+
+
+    ' 1) Найти строку с "Всего проводок" в колонке B
+    Dim rowTotal As Long
+    rowTotal = FindFirstInColumnExact(ws, ANCHOR_COL, ANCHOR_TEXT)
+    If rowTotal = 0 Then
+        Private_Log "Не найдена ячейка '" & ANCHOR_TEXT & "' в колонке B на листе '" & DST_SHEET & "'."
+        GoTo Tidy
+    End If
+
+
+    ' 2) Найти рамки агрегированной таблицы на ЭТОМ ЖЕ листе
+    Dim blockAnchorRow As Long
+    blockAnchorRow = FindFirstInColumnExact(ws, ANCHOR_COL, BLOCK_ANCHOR_TEXT)
+    If blockAnchorRow = 0 Then
+        Private_Log "Не найден якорь блока '" & BLOCK_ANCHOR_TEXT & "' на листе '" & DST_SHEET & "'."
+        GoTo Tidy
+    End If
+
+
+    Dim hdrRow As Long: hdrRow = blockAnchorRow + 1          ' строка шапки
+    Dim dataTop As Long: dataTop = hdrRow + 1
+    Dim totalRow As Long
+    totalRow = FindFirstBelowInColumnExact(ws, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Or totalRow <= dataTop Then
+        Private_Log "Не найдена строка '" & TOTAL_TEXT & "' ниже шапки на листе '" & DST_SHEET & "'."
+        GoTo Tidy
+    End If
+    Dim dataBottom As Long: dataBottom = totalRow - 1
+    If dataBottom < dataTop Then
+        Private_Log "Нет данных в агрегированной таблице — формулы не вставлены."
+        GoTo Tidy
+    End If
+
+
+    ' 3) Найти точные колонки "Сумма" и "Меппинг" по шапке
+    Dim cSum As Long, cMap As Long
+    cSum = FindHeaderOnRow(ws, hdrRow, "Сумма")
+    cMap = FindHeaderOnRow(ws, hdrRow, "Меппинг")
+    If cSum = 0 Or cMap = 0 Then
+        Private_Log "Не найдены колонки 'Сумма'(" & cSum & ") или 'Меппинг'(" & cMap & ") в шапке."
+        GoTo Tidy
+    End If
+
+
+    ' 4) Диапазоны для формул (именно на этом листе)
+    Dim rngSum As Range, rngMap As Range
+    Set rngSum = ws.Range(ws.Cells(dataTop, cSum), ws.Cells(dataBottom, cSum))
+    Set rngMap = ws.Range(ws.Cells(dataTop, cMap), ws.Cells(dataBottom, cMap))
+
+
+    ' 5) Куда ставим (правее "Всего проводок" и ниже)
+    Dim targetCol As Long: targetCol = ANCHOR_COL + 1
+    Dim c1 As Range, c2 As Range, c3 As Range
+    Set c1 = ws.Cells(rowTotal, targetCol)
+    Set c2 = ws.Cells(rowTotal + 1, targetCol)
+    Set c3 = ws.Cells(rowTotal + 2, targetCol)
+
+
+    ' 6) Формулы с ЯВНЫМ именем листа
+    Dim sheetQuoted As String
+    sheetQuoted = "'" & EscapeSheetName(ws.name) & "'!"
+
+
+    Dim addrSum As String, addrMap As String
+    addrSum = sheetQuoted & rngSum.Address(False, False)
+    addrMap = sheetQuoted & rngMap.Address(False, False)
+
+
+    Dim f1 As String, f2 As String, f3 As String
+    f1 = "=СУММ(" & addrSum & ")/1000"
+    f2 = "=СУММЕСЛИ(" & addrMap & ";""<>Популяция для тестирования"";" & addrSum & ") /1000"
+    f3 = "=СУММЕСЛИ(" & addrMap & ";""Популяция для тестирования"";" & addrSum & ") /1000"
+
+
+    c1.FormulaLocal = f1
+    c2.FormulaLocal = f2
+    c3.FormulaLocal = f3
+
+
+    c1.NumberFormatLocal = NUM_FMT
+    c2.NumberFormatLocal = NUM_FMT
+    c3.NumberFormatLocal = NUM_FMT
+
+
+    Private_Log "Формулы вставлены на '" & DST_SHEET & "': f1=" & f1 & " | f2=" & f2 & " | f3=" & f3
+    Private_Log "Ряды: Map=" & rngMap.Address & " ; Sum=" & rngSum.Address
+
+
+Tidy:
+    Application.EnableEvents = ev
+    Application.ScreenUpdating = su
+    Application.DisplayAlerts = al
+    Application.Calculation = calc
+    Private_Log "Готово v" & MODULE_VERSION & " — " & Format$(Timer - t0, "0.00") & " c"
+    Exit Sub
+
+
+EH:
+    Private_Log "ОШИБКА [" & Err.Number & "]: " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'============================== ХЕЛПЕРЫ ========================================
+
+
+Private Function EscapeSheetName(ByVal s As String) As String
+    ' Для формул Excel имя листа с одинарной кавычкой нужно экранировать двойной
+    EscapeSheetName = Replace(s, "'", "''")
+End Function
+
+
+Private Function FindHeaderOnRow(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headerText As String) As Long
+    Dim lastCol As Long, j As Long
+    lastCol = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        If CStr(ws.Cells(rowNum, j).Value) = headerText Then
+            FindHeaderOnRow = j
+            Exit Function
+        End If
+    Next j
+End Function
+
+
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+Private Function FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long: lastRow = ws.Rows.Count
+    Dim rng As Range, f As Range
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstBelowInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstBelowInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+'============================== ЛОГИ ===========================================
+
+
+Private Sub Private_Log(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Excl_Formula v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub

@@ -1,0 +1,302 @@
+﻿﻿Option Explicit
+
+
+'===============================================================================
+' Модуль:    modJP_Mapping_Sync
+' Версия:    1.0.0  (16.09.2025)
+'
+' Назначение:
+'   - SyncMappingChange_One: заменить меппинг у заданной Проводки во всех листах ЖП_обработанный_*
+'     ТОЛЬКО там, где текущий меппинг равен "oldMap" (учёт канонизации).
+'   - ApplyMappingValidationOnExclusions: поставить проверку данных (список допустимых меппингов)
+'     на столбец "Меппинг" листа "2. Проводки к исключению".
+'
+' Производительность:
+'   - По каждому источнику читается массив столбца "Проводка" и "Меппинг" (2 массива),
+'     изменения делаются в массиве, запись одним присваиванием на столбец "Меппинг".
+'===============================================================================
+
+
+Private Const MODULE_VERSION As String = "1.0.0"
+Private Const LOG_SHEET      As String = "Логи"
+
+
+Private Const PROCESSED_PREFIX As String = "ЖП_обработанный_"
+Private Const DST_SHEET        As String = "2. Проводки к исключению"
+
+
+' ---------- Публичная точка: синхронизация одного изменения ----------
+Public Sub SyncMappingChange_One(ByVal provText As String, ByVal oldMap As String, ByVal newMap As String)
+    Dim t0 As Double: t0 = Timer
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    Dim oldKey As String: oldKey = CanonMapKeyCommon(oldMap)
+    Dim newKey As String: newKey = CanonMapKeyCommon(newMap)
+
+
+    Dim sh As Worksheet
+    Dim totalChanged As Long
+
+
+    For Each sh In wb.Worksheets
+        If Left$(sh.Name, Len(PROCESSED_PREFIX)) = PROCESSED_PREFIX Then
+            totalChanged = totalChanged + SyncOnOneSheet(sh, provText, oldKey, newMap)
+        End If
+    Next sh
+
+
+    LogWrite "Синхронизация меппинга: Пров='" & Left$(provText, 80) & "'; old='" & oldMap & "' -> new='" & newMap & _
+             "'; Изменено строк всего=" & totalChanged & "; " & Format$(Timer - t0, "0.00") & " c"
+End Sub
+
+
+' Возвращает число изменённых строк на листе
+Private Function SyncOnOneSheet(ByVal ws As Worksheet, ByVal provText As String, ByVal oldKey As String, ByVal newMap As String) As Long
+    On Error GoTo SafeExit
+
+
+    Dim cProv As Long, cMap As Long
+    cProv = FindHeaderCol(ws, "Проводка")
+    cMap = FindHeaderSyn(ws, Array("Меппинг", "меппинг", "mapping"))
+
+
+    If cProv = 0 Or cMap = 0 Then Exit Function
+
+
+    Dim lr As Long
+    lr = LastDataRowOnCols(ws, Array(cProv, cMap))
+    If lr < 2 Then Exit Function
+
+
+    Dim aProv As Variant, aMap As Variant
+    aProv = ws.Range(ws.Cells(2, cProv), ws.Cells(lr, cProv)).Value2
+    aMap  = ws.Range(ws.Cells(2, cMap),  ws.Cells(lr, cMap)).Value2
+
+
+    Dim i As Long, changed As Long
+    Dim prov As String, mapDisp As String
+
+
+    For i = 1 To UBound(aProv, 1)
+        prov = CStr(aProv(i, 1))
+        If StrComp(prov, provText, vbBinaryCompare) = 0 Then
+            mapDisp = CStr(aMap(i, 1))
+            If CanonMapKeyCommon(mapDisp) = oldKey Then
+                aMap(i, 1) = newMap
+                changed = changed + 1
+            End If
+        End If
+    Next i
+
+
+    If changed > 0 Then
+        ws.Range(ws.Cells(2, cMap), ws.Cells(lr, cMap)).Value = aMap
+        LogWrite "Лист '" & ws.Name & "': изменено " & changed & " строк (меппинг)"
+    End If
+
+
+    SyncOnOneSheet = changed
+SafeExit:
+End Function
+
+
+' ---------- Публичная точка: повесить проверку данных на столбец "Меппинг" исключений ----------
+Public Sub ApplyMappingValidationOnExclusions()
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim ws As Worksheet: Set ws = wb.Worksheets(DST_SHEET)
+
+
+    Dim anchorCol As Long: anchorCol = 2
+    Dim anchorRow As Long: anchorRow = FindFirstInColumnExact(ws, anchorCol, "Анализ проводок к исключению>>>")
+    If anchorRow = 0 Then
+        LogWrite "Валидация: якорь не найден на '" & DST_SHEET & "'"
+        Exit Sub
+    End If
+
+
+    Dim hdrRow As Long: hdrRow = anchorRow + 1
+    Dim cMap As Long:  cMap = FindHeaderColOnRow(ws, hdrRow, "Меппинг")
+
+
+    If cMap = 0 Then
+        LogWrite "Валидация: не найден столбец 'Меппинг' на '" & DST_SHEET & "'"
+        Exit Sub
+    End If
+
+
+    Dim dataTop As Long:    dataTop = hdrRow + 1
+    Dim totalRow As Long:   totalRow = FindFirstBelowInColumnExact(ws, anchorCol, "Итого", dataTop)
+    If totalRow = 0 Then
+        LogWrite "Валидация: не найдена строка 'Итого' на '" & DST_SHEET & "'"
+        Exit Sub
+    End If
+    Dim dataBottom As Long: dataBottom = totalRow - 1
+    If dataBottom < dataTop Then
+        LogWrite "Валидация: нет данных — применение пропущено"
+        Exit Sub
+    End If
+
+
+    ' Подготовим лист-справочник и именованный диапазон
+    Dim nmList As String: nmList = "VAL_MAPPINGS"
+    Dim wsAux As Worksheet
+    On Error Resume Next
+    Set wsAux = wb.Worksheets("_справочники_меппинг")
+    On Error GoTo 0
+    If wsAux Is Nothing Then
+        Set wsAux = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+        wsAux.Name = "_справочники_меппинг"
+        wsAux.Visible = xlSheetHidden
+    End If
+
+
+    ' Заполним список
+    Dim arr As Variant: arr = AllowedMappings()
+    Dim i As Long
+    wsAux.Cells.Clear
+    For i = LBound(arr) To UBound(arr)
+        wsAux.Cells(i + 1, 1).Value = CStr(arr(i))
+    Next i
+
+
+    ' Имя на весь столбец с фактическим диапазоном значений
+    Dim lastRow As Long: lastRow = wsAux.Cells(wsAux.Rows.Count, 1).End(xlUp).Row
+    Dim rngList As Range: Set rngList = wsAux.Range(wsAux.Cells(1, 1), wsAux.Cells(lastRow, 1))
+
+
+    ' Создадим/переопределим именованный диапазон
+    On Error Resume Next
+    wb.Names(nmList).Delete
+    On Error GoTo 0
+    wb.Names.Add Name:=nmList, RefersTo:=rngList
+
+
+    ' Применим валидацию
+    With ws.Range(ws.Cells(dataTop, cMap), ws.Cells(dataBottom, cMap))
+        .Validation.Delete
+        .NumberFormat = "@"
+        .Validation.Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+                        Operator:=xlBetween, Formula1:="=" & nmList
+        .Validation.IgnoreBlank = True
+        .Validation.InCellDropdown = True
+        .Validation.InputTitle = "Меппинг"
+        .Validation.InputMessage = "Выберите меппинг из списка"
+        .Validation.ErrorTitle = "Недопустимое значение"
+        .Validation.ErrorMessage = "Ввод только из списка допустимых меппингов"
+        .Validation.ShowError = True
+    End With
+
+
+    LogWrite "Валидация на '" & DST_SHEET & "': применена к " & (dataBottom - dataTop + 1) & " строкам (колонка '" & cMap & "')"
+End Sub
+
+
+' ---------- Локальные утилиты поиска ----------
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String) As Long
+    Dim c As Range
+    Set c = ws.Rows(1).Find(what:=headerName, LookAt:=xlWhole, LookIn:=xlValues, MatchCase:=False)
+    If c Is Nothing Then FindHeaderCol = 0 Else FindHeaderCol = c.Column
+End Function
+
+
+Private Function FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant) As Long
+    Dim lastCol As Long, j As Long, key As String, i As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        key = NormalizeHeaderText(CStr(ws.Cells(1, j).Value))
+        If key <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                If key = NormalizeHeaderText(CStr(syns(i))) Then
+                    FindHeaderSyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+End Function
+
+
+Private Function FindHeaderColOnRow(ByVal ws As Worksheet, ByVal rowNum As Long, ByVal headerName As String) As Long
+    Dim lastCol As Long, j As Long
+    lastCol = ws.Cells(rowNum, ws.Columns.Count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        If CStr(ws.Cells(rowNum, j).Value) = headerName Then
+            FindHeaderColOnRow = j
+            Exit Function
+        End If
+    Next j
+End Function
+
+
+Private Function LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long, j As Long, lrj As Long, c As Long
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    LastDataRowOnCols = lr
+End Function
+
+
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then FindFirstInColumnExact = f.MergeArea.Row Else FindFirstInColumnExact = f.Row
+    End If
+End Function
+
+
+Private Function FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long: lastRow = ws.Rows.Count
+    Dim rng As Range, f As Range
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstBelowInColumnExact = 0
+    Else
+        If f.MergeCells Then FindFirstBelowInColumnExact = f.MergeArea.Row Else FindFirstBelowInColumnExact = f.Row
+    End If
+End Function
+
+
+Private Function NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeHeaderText = LCase$(s)
+End Function
+
+
+' ---------- Логи ----------
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "JP Mapping Sync v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub

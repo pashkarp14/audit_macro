@@ -1,0 +1,719 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modOps_ManualWithRelated
+' Версия:    1.3.0  (22.09.2025)
+'
+' Что нового в 1.3.0:
+'   - Добавлена функция OS_TestedEligibleThisTest: строки с меткой ЭТОГО теста
+'     в колонке "Протестировано?" НЕ отбрасываются (как и пустые).
+'     Метка этого теста: "См. ручные со связ. ст".
+'   - Реализовано через общий хелпер OS_AcceptTestedCell(includeOwn:=True, ownLabel).
+'
+' Что нового в 1.2.0:
+'   - Механизм отбора популяции приведён к эталону:
+'       • индексы нужных колонок ("Документ", "Протестировано?", "Связанные?") определяются
+'         на КАЖДОМ листе популяции по шапке;
+'       • при сборе данных колонки мэппятся по именам шапки для каждого листа;
+'       • если на листе нет какой-то из «оставляемых» колонок, в вывод пишется пусто.
+'   - Убрано копирование ширины столбцов.
+'
+' Важно: место вставки, правила отбора, состав/порядок колонок, формула «Итого» —
+'        НЕ изменялись.
+'
+' Правила отбора:
+'   • "Протестировано?" ПУСТО ИЛИ (содержит метку этого теста "См. ручные со связ. ст")
+'   • "Связанные?" == "ВГО" (без учёта регистра/пробелов)
+'   • "Документ" содержит "Операция" и НЕ содержит "регламентн"
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.3.0"
+Private Const LOG_SHEET    As String = "Логи"
+
+
+' Целевой лист/якоря
+Private Const DST_SHEET   As String = "9. Ручные со связ. ст"
+Private Const ANCHOR_COL  As Long = 2
+Private Const ANCHOR_TEXT As String = "Ручные проводки со связанными сторонами>>>"
+Private Const TOTAL_TEXT  As String = "Итого"
+
+
+' Источники (популяция)
+Private Const POP_BASE As String = "Популяция для тестирования"
+Private Const POP_PART_SUFF As String = "_Ч"
+
+
+' Формат чисел в итого
+Private Const NUM_FMT As String = "# ##0;-# ##0;-"
+
+
+' --- Новое: метка этого теста и флаг "включать свои помеченные"
+Private Const OWN_TEST_LABEL As String = "См. ручные со связ. ст"
+Private Const INCLUDE_OWN_MARKED As Boolean = True
+
+
+' Переменные для логов шагов
+Private currentStep As String
+Private stepT As Double
+
+
+'========================================================================================
+' ТОЧКА ВХОДА
+'========================================================================================
+Public Sub Заполнить_Ручные_Со_Связанными_Сторонами()
+    Dim t0 As Double: t0 = Timer
+
+
+    Dim appCalc As XlCalculation, scrUp As Boolean, evt As Boolean, alr As Boolean
+    appCalc = Application.Calculation
+    scrUp = Application.ScreenUpdating
+    evt = Application.EnableEvents
+    alr = Application.DisplayAlerts
+
+
+    On Error GoTo EH
+
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+
+    LogWrite OS_NowStr() & vbTab & "Старт" & vbTab & "Заполнить_Ручные_Со_Связанными_Сторонами v" & MacroVersion
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+
+    ' ---------- Поиск целевого листа и якоря ----------
+    StartStep "Поиск листа '" & DST_SHEET & "' и якоря"
+    Dim wsDst As Worksheet: Set wsDst = wb.Worksheets(DST_SHEET)
+
+
+    Dim anchorRow As Long, headerTop As Long, dataTop As Long, totalRow As Long, dataBottom As Long
+    anchorRow = OS_FindFirstInColumnExact(wsDst, ANCHOR_COL, ANCHOR_TEXT)
+    If anchorRow = 0 Then Err.Raise 5, , "Якорь не найден: " & ANCHOR_TEXT
+
+
+    headerTop = anchorRow + 1
+    dataTop = headerTop + 1
+
+
+    totalRow = OS_FindFirstBelowInColumnExact(wsDst, ANCHOR_COL, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Or totalRow <= dataTop Then Err.Raise 5, , "Метка 'Итого' не найдена ниже якоря"
+
+
+    dataBottom = totalRow - 1
+
+
+    LogWrite OS_NowStr() & vbTab & "? Приёмник" & vbTab & _
+        "AnchorRow=" & anchorRow & "; HeaderTop=" & headerTop & "; DataTop=" & dataTop & "; TotalRow=" & totalRow
+    EndStep
+
+
+    ' ---------- Поиск листов популяции ----------
+    StartStep "Поиск листов популяции"
+    Dim popSheets As Collection
+    Set popSheets = OS_GetPopulationSheets(wb)
+    If popSheets Is Nothing Or popSheets.Count = 0 Then
+        LogWrite OS_NowStr() & vbTab & "Внимание" & vbTab & "Листы популяции не найдены"
+        GoTo FinishOK
+    End If
+    LogWrite OS_NowStr() & vbTab & "Найдено листов популяции" & vbTab & popSheets.Count
+    EndStep
+
+
+    ' ---------- Опорная шапка (образец) и набор выводимых колонок ----------
+    StartStep "Определение шапки/столбцов на образце (исключая 'Связанные?','Ответственный','Протестировано?')"
+    Dim wsSample As Worksheet: Set wsSample = popSheets(1)
+    Dim lastColSample As Long: lastColSample = wsSample.Cells(1, wsSample.Columns.Count).End(xlToLeft).Column
+
+
+    Dim hdrNames() As String, i As Long
+    ReDim hdrNames(1 To lastColSample)
+    For i = 1 To lastColSample
+        hdrNames(i) = CStr(wsSample.Cells(1, i).Value)
+    Next i
+
+
+    Dim hdrSum As String, hdrDoc As String, hdrTested As String, hdrLinked As String, hdrResp As String
+    Dim cSumSample As Long, cDocSample As Long, cTestedSample As Long, cLinkedSample As Long, cRespSample As Long
+
+
+    cSumSample = OS_FindHeaderSyn(wsSample, Array("Сумма", " сумма", "сумма ", "Сумма абс", "Сумма абс.", "Сумма абсолютная", "Сумма (абс)"), 1, hdrSum)
+    If cSumSample = 0 Then Err.Raise 5, , "На листе популяции (образце) не найден столбец 'Сумма'"
+
+
+    cDocSample = OS_FindHeaderSyn(wsSample, Array("Документ", " документ", "документ "), 1, hdrDoc)
+    If cDocSample = 0 Then Err.Raise 5, , "На листе популяции (образце) не найден столбец 'Документ'"
+
+
+    cTestedSample = OS_FindHeaderSyn(wsSample, Array("Протестировано?", " протестировано?", "протестировано? ", "Протестировано", " протестировано", "протестировано "), 1, hdrTested)
+    If cTestedSample = 0 Then Err.Raise 5, , "На листе популяции (образце) не найден столбец 'Протестировано?'"
+
+
+    cLinkedSample = OS_FindHeaderSyn(wsSample, Array("Связанные?", " Связанные?", "Связанные? "), 1, hdrLinked)
+    If cLinkedSample = 0 Then Err.Raise 5, , "На листе популяции (образце) не найден столбец 'Связанные?'"
+
+
+    cRespSample = OS_FindHeaderSyn(wsSample, Array("Ответственный", " Ответственный", "Ответственный "), 1, hdrResp)
+
+
+    ' Колонки к выводу задаём по ОБРАЗЦУ (исключая три)
+    Dim keepCols As Collection: Set keepCols = New Collection
+    For i = 1 To lastColSample
+        If i <> cLinkedSample And i <> cRespSample And i <> cTestedSample Then
+            keepCols.Add i
+        End If
+    Next i
+
+
+    Dim outCols As Long: outCols = keepCols.Count
+
+
+    ' Позиция "Сумма" в выходном наборе (для формулы Итого)
+    Dim posSumOut As Long: posSumOut = OS_PosOfColInKeep(keepCols, cSumSample)
+    If posSumOut = 0 Then Err.Raise 5, , "В наборе выводимых колонок не найден 'Сумма'"
+
+
+    ' Для мэппинга по листам сохраним имена шапок выводимых колонок
+    Dim keepHdrNames() As String: ReDim keepHdrNames(1 To outCols)
+    For i = 1 To outCols
+        keepHdrNames(i) = hdrNames(CLng(keepCols(i))) ' имя колонки из образца
+    Next i
+
+
+    LogWrite OS_NowStr() & vbTab & "? Шапка/столбцы (образец)" & vbTab & _
+        "ВсегоКолонок=" & lastColSample & "; К_выводу=" & outCols & _
+        "; Sum=c" & cSumSample & "; Doc=c" & cDocSample & "; Tested=c" & cTestedSample & _
+        "; Linked=c" & cLinkedSample & "; Resp=" & OS_ReportZero(cRespSample) & _
+        "; Исключены: Linked, Tested, Resp; SumOutPos=" & posSumOut
+    EndStep
+
+
+    ' ---------- Подсчёт строк (каждый лист — свои индексы условий) ----------
+    StartStep "Подсчёт строк, проходящих условия (каждый лист — свои индексы)"
+    Dim totalRows As Long: totalRows = 0
+
+
+    Dim shIdx As Long
+    For shIdx = 1 To popSheets.Count
+        Dim ws As Worksheet: Set ws = popSheets(shIdx)
+
+
+        ' На КАЖДОМ листе определяем колонки для условий
+        Dim hdrDocS As String, hdrTestedS As String, hdrLinkedS As String
+        Dim cDocS As Long, cTestedS As Long, cLinkedS As Long
+        cDocS = OS_FindHeaderSyn(ws, Array("Документ", " документ", "документ "), 1, hdrDocS)
+        cTestedS = OS_FindHeaderSyn(ws, Array("Протестировано?", " протестировано?", "протестировано? ", "Протестировано", " протестировано", "протестировано "), 1, hdrTestedS)
+        cLinkedS = OS_FindHeaderSyn(ws, Array("Связанные?", " Связанные?", "Связанные? "), 1, hdrLinkedS)
+
+
+        If cDocS = 0 Or cTestedS = 0 Or cLinkedS = 0 Then
+            LogWrite OS_NowStr() & vbTab & "Пропуск листа (нет нужных колонок): " & ws.Name
+            GoTo NextSheetCount
+        End If
+
+
+        Dim lr As Long: lr = OS_LastDataRowOnCols(ws, Array(cDocS, cTestedS, cLinkedS))
+        If lr < 2 Then GoTo NextSheetCount
+
+
+        Dim minC As Long, maxC As Long, block As Variant
+        minC = 1
+        maxC = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+        block = ws.Range(ws.Cells(1, minC), ws.Cells(lr, maxC)).Value2
+
+
+        Dim idxDoc As Long, idxTested As Long, idxLinked As Long
+        idxDoc = cDocS - minC + 1
+        idxTested = cTestedS - minC + 1
+        idxLinked = cLinkedS - minC + 1
+
+
+        Dim localCnt As Long: localCnt = 0
+        Dim rowSrc As Long
+        For rowSrc = 2 To lr
+            If OS_TestedEligibleThisTest(block(rowSrc, idxTested)) Then
+                If OS_EqualTextTrim(block(rowSrc, idxLinked), "ВГО") Then
+                    If OS_TextContainsCI(block(rowSrc, idxDoc), "операция") Then
+                        If Not OS_TextContainsSubstrCI(block(rowSrc, idxDoc), "регламентн") Then
+                            totalRows = totalRows + 1
+                            localCnt = localCnt + 1
+                        End If
+                    End If
+                End If
+            End If
+        Next rowSrc
+
+
+        LogWrite OS_NowStr() & vbTab & "Подсчёт на листе" & vbTab & ws.Name & ": " & localCnt & " строк"
+NextSheetCount:
+    Next shIdx
+
+
+    LogWrite OS_NowStr() & vbTab & "? Подсчёт" & vbTab & "Всего строк к копированию=" & totalRows
+    EndStep
+
+
+    ' ---------- Очистка и подгонка строк ----------
+    StartStep "Очистка области и подгонка количества строк"
+    Dim rngAllOld As Range
+    Set rngAllOld = wsDst.Range(wsDst.Cells(headerTop, ANCHOR_COL), wsDst.Cells(IIf(dataBottom >= headerTop, dataBottom, headerTop), ANCHOR_COL + outCols - 1))
+    On Error Resume Next
+    rngAllOld.Borders.LineStyle = xlNone
+    On Error GoTo 0
+
+
+    If dataBottom >= dataTop Then
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataBottom, ANCHOR_COL + outCols - 1)).ClearContents
+    End If
+    wsDst.Range(wsDst.Cells(headerTop, ANCHOR_COL), wsDst.Cells(headerTop, ANCHOR_COL + outCols - 1)).ClearContents
+
+
+    Dim need As Long: need = totalRows
+    Dim nRowsDst As Long: nRowsDst = dataBottom - dataTop + 1
+    Dim needIns As Long, needDel As Long
+
+
+    If need < 0 Then need = 0
+
+
+    If nRowsDst < need Then
+        needIns = need - nRowsDst
+        If needIns > 0 Then
+            wsDst.Rows(dataBottom).Resize(needIns).Insert xlShiftDown
+            totalRow = totalRow + needIns
+            dataBottom = dataTop + need - 1
+            LogWrite OS_NowStr() & vbTab & "Вставлено строк" & vbTab & needIns
+        End If
+    ElseIf nRowsDst > need Then
+        needDel = nRowsDst - need
+        If needDel > 0 Then
+            wsDst.Rows(dataTop + need).Resize(needDel).Delete xlShiftUp
+            totalRow = totalRow - needDel
+            dataBottom = dataTop + need - 1
+            LogWrite OS_NowStr() & vbTab & "Удалено лишних строк" & vbTab & needDel
+        End If
+    Else
+        LogWrite OS_NowStr() & vbTab & "Подгонка строк" & vbTab & "Не требуется"
+    End If
+    EndStep
+
+
+    ' ---------- Шапка (значения + форматы) ----------
+    StartStep "Вывод шапки (с форматами)"
+    Dim j As Long
+    For j = 1 To outCols
+        Dim srcCol As Long: srcCol = CLng(keepCols(j))     ' колонка на образце
+        Dim dstCol As Long: dstCol = ANCHOR_COL + j - 1
+
+
+        wsDst.Cells(headerTop, dstCol).Value = wsSample.Cells(1, srcCol).Value
+
+
+        ' Только форматы шапки; ширину колонок НЕ копируем
+        wsSample.Cells(1, srcCol).Copy
+        wsDst.Cells(headerTop, dstCol).PasteSpecial xlPasteFormats
+    Next j
+    OS_ThickBorder wsDst.Range(wsDst.Cells(headerTop, ANCHOR_COL), wsDst.Cells(headerTop, ANCHOR_COL + outCols - 1))
+    Application.CutCopyMode = False
+    EndStep
+
+
+    ' ---------- Сбор данных (каждый лист — свои индексы + мэппинг по именам) ----------
+    StartStep "Сбор данных в массив и вывод"
+    Dim outArr() As Variant
+    If totalRows > 0 Then
+        ReDim outArr(1 To totalRows, 1 To outCols)
+    Else
+        ReDim outArr(1 To 1, 1 To outCols)
+    End If
+
+
+    Dim writeRow As Long: writeRow = 1
+
+
+    Dim shIdx2 As Long
+    For shIdx2 = 1 To popSheets.Count
+        Dim wsSrc As Worksheet: Set wsSrc = popSheets(shIdx2)
+
+
+        ' На КАЖДОМ листе — индексы условий
+        Dim hdrDocS2 As String, hdrTestedS2 As String, hdrLinkedS2 As String
+        Dim cDocS2 As Long, cTestedS2 As Long, cLinkedS2 As Long
+        cDocS2 = OS_FindHeaderSyn(wsSrc, Array("Документ", " документ", "документ "), 1, hdrDocS2)
+        cTestedS2 = OS_FindHeaderSyn(wsSrc, Array("Протестировано?", " протестировано?", "протестировано? ", "Протестировано", " протестировано", "протестировано "), 1, hdrTestedS2)
+        cLinkedS2 = OS_FindHeaderSyn(wsSrc, Array("Связанные?", " Связанные?", "Связанные? "), 1, hdrLinkedS2)
+
+
+        If cDocS2 = 0 Or cTestedS2 = 0 Or cLinkedS2 = 0 Then GoTo NextSheetFill
+
+
+        Dim lr2 As Long: lr2 = OS_LastDataRowOnCols(wsSrc, Array(cDocS2, cTestedS2, cLinkedS2))
+        If lr2 < 2 Then GoTo NextSheetFill
+
+
+        ' Карта шапки ЭТОГО листа: имя -> колонка
+        Dim hdrMap As Object: Set hdrMap = OS_BuildHeaderIndex(wsSrc, 1)
+
+
+        Dim minC As Long, maxC As Long, block As Variant
+        minC = 1
+        maxC = wsSrc.Cells(1, wsSrc.Columns.Count).End(xlToLeft).Column
+        block = wsSrc.Range(wsSrc.Cells(1, minC), wsSrc.Cells(lr2, maxC)).Value2
+
+
+        Dim idxDoc2 As Long, idxTested2 As Long, idxLinked2 As Long
+        idxDoc2 = cDocS2 - minC + 1
+        idxTested2 = cTestedS2 - minC + 1
+        idxLinked2 = cLinkedS2 - minC + 1
+
+
+        Dim rowSrc As Long
+        For rowSrc = 2 To lr2
+            If OS_TestedEligibleThisTest(block(rowSrc, idxTested2)) Then
+                If OS_EqualTextTrim(block(rowSrc, idxLinked2), "ВГО") Then
+                    If OS_TextContainsCI(block(rowSrc, idxDoc2), "операция") Then
+                        If Not OS_TextContainsSubstrCI(block(rowSrc, idxDoc2), "регламентн") Then
+
+
+                            ' По каждому выводимому столбцу берём значение по ИМЕНИ шапки на этом листе
+                            For j = 1 To outCols
+                                Dim wantHdr As String, wantKey As String, srcC As Long, rel As Long
+                                wantHdr = keepHdrNames(j)
+                                wantKey = OS_NormalizeHeaderText(wantHdr)
+
+
+                                If hdrMap.exists(wantKey) Then
+                                    srcC = CLng(hdrMap(wantKey))
+                                    rel = srcC - minC + 1
+                                    outArr(writeRow, j) = block(rowSrc, rel)
+                                Else
+                                    outArr(writeRow, j) = Empty  ' на листе нет такой колонки — пишем пусто
+                                End If
+                            Next j
+
+
+                            writeRow = writeRow + 1
+                        End If
+                    End If
+                End If
+            End If
+        Next rowSrc
+
+
+        LogWrite OS_NowStr() & vbTab & "Выборка на листе" & vbTab & wsSrc.Name & ": накоплено=" & (writeRow - 1)
+NextSheetFill:
+    Next shIdx2
+
+
+    If totalRows > 0 Then
+        wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataTop + totalRows - 1, ANCHOR_COL + outCols - 1)).Value = outArr
+    End If
+    EndStep
+
+
+    ' ---------- Форматирование данных по образцу (NumberFormatLocal) ----------
+    StartStep "Форматирование данных (NumberFormatLocal по образцу)"
+    If totalRows > 0 Then
+        Dim dstCol2 As Long, srcCol2 As Long
+        Dim rngCol As Range
+        For j = 1 To outCols
+            dstCol2 = ANCHOR_COL + j - 1
+            srcCol2 = CLng(keepCols(j)) ' колонка на образце
+            Set rngCol = wsDst.Range(wsDst.Cells(dataTop, dstCol2), wsDst.Cells(dataTop + totalRows - 1, dstCol2))
+            On Error Resume Next
+            rngCol.NumberFormatLocal = wsSample.Cells(2, srcCol2).NumberFormatLocal
+            On Error GoTo 0
+        Next j
+    End If
+
+
+    If totalRows > 0 Then
+        OS_ThickBorder wsDst.Range(wsDst.Cells(dataTop, ANCHOR_COL), wsDst.Cells(dataTop + totalRows - 1, ANCHOR_COL + outCols - 1))
+    End If
+
+
+    LogWrite OS_NowStr() & vbTab & "? Вывод" & vbTab & "Строк вставлено=" & totalRows & "; Колонок=" & outCols
+    EndStep
+
+
+    ' ---------- Формула суммы под столбцом "Сумма" ----------
+    StartStep "Формула суммы под столбцом 'Сумма'"
+    Dim dstSumCol As Long: dstSumCol = ANCHOR_COL + posSumOut - 1
+    If totalRows > 0 Then
+        Dim rngSum As Range
+        Set rngSum = wsDst.Range(wsDst.Cells(dataTop, dstSumCol), wsDst.Cells(dataTop + totalRows - 1, dstSumCol))
+        wsDst.Cells(totalRow, dstSumCol).FormulaLocal = "=СУММ(" & rngSum.Address(False, False) & ")"
+        wsDst.Cells(totalRow, dstSumCol).NumberFormatLocal = NUM_FMT
+    Else
+        wsDst.Cells(totalRow, dstSumCol).FormulaLocal = "=0"
+        wsDst.Cells(totalRow, dstSumCol).NumberFormatLocal = NUM_FMT
+    End If
+    EndStep
+
+
+FinishOK:
+    LogWrite OS_NowStr() & vbTab & "Готово" & vbTab & "Строк всего=" & totalRows & "; Время, сек=" & Format$(Timer - t0, "0.00")
+
+
+Tidy:
+    Application.ScreenUpdating = scrUp
+    Application.EnableEvents = evt
+    Application.DisplayAlerts = alr
+    Application.Calculation = appCalc
+    Exit Sub
+
+
+EH:
+    LogWrite OS_NowStr() & vbTab & "Ошибка" & vbTab & "Step='" & currentStep & "'; " & Err.Number & " — " & Err.Description
+    Resume Tidy
+End Sub
+
+
+'========================================================================================
+' ХЕЛПЕРЫ (локальные имена с префиксом OS_)
+'========================================================================================
+
+
+' Эталонная логика: либо базовый лист, либо части "_Ч…", но не обе схемы сразу
+Private Function OS_GetPopulationSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection, sh As Worksheet, foundBase As Boolean
+    For Each sh In wb.Worksheets
+        If sh.Name = POP_BASE Then
+            col.Add sh
+            foundBase = True
+            Exit For
+        End If
+    Next sh
+    If foundBase Then
+        Set OS_GetPopulationSheets = col
+        Exit Function
+    End If
+    For Each sh In wb.Worksheets
+        If Left$(sh.Name, Len(POP_BASE & POP_PART_SUFF)) = POP_BASE & POP_PART_SUFF Then
+            col.Add sh
+        End If
+    Next sh
+    Set OS_GetPopulationSheets = col
+End Function
+
+
+' Построить карту шапки: нормализованное имя -> индекс колонки
+Private Function OS_BuildHeaderIndex(ByVal ws As Worksheet, ByVal hdrRow As Long) As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+    Dim lastCol As Long: lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim c As Long, key As String, raw As String
+    For c = 1 To lastCol
+        raw = CStr(ws.Cells(hdrRow, c).Value)
+        key = OS_NormalizeHeaderText(raw)
+        If Len(key) > 0 Then
+            If Not dict.Exists(key) Then dict.Add key, c
+        End If
+    Next c
+    Set OS_BuildHeaderIndex = dict
+End Function
+
+
+Private Function OS_FindHeaderSyn(ByVal ws As Worksheet, ByVal syns As Variant, ByVal hdrRow As Long, ByRef matchedHeader As String) As Long
+    Dim lastCol As Long, c As Long, head As String, i As Long
+    matchedHeader = vbNullString
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        head = OS_NormalizeHeaderText(CStr(ws.Cells(hdrRow, c).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                If head = OS_NormalizeHeaderText(CStr(syns(i))) Then
+                    matchedHeader = CStr(ws.Cells(hdrRow, c).Value)
+                    OS_FindHeaderSyn = c
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next c
+End Function
+
+
+Private Function OS_FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        OS_FindFirstInColumnExact = 0
+    Else
+        OS_FindFirstInColumnExact = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+Private Function OS_FindFirstBelowInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long, rng As Range, f As Range
+    lastRow = ws.Rows.Count
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        OS_FindFirstBelowInColumnExact = 0
+    Else
+        OS_FindFirstBelowInColumnExact = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+Private Function OS_LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long: lr = 0
+    Dim j As Long, lrj As Long, c As Long
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    OS_LastDataRowOnCols = lr
+End Function
+
+
+Private Function OS_NormalizeHeaderText(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = Trim$(s)
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    OS_NormalizeHeaderText = LCase$(s)
+End Function
+
+
+Private Function OS_IsEmptyOrTrimEmpty(ByVal v As Variant) As Boolean
+    Dim s As String
+    If IsEmpty(v) Then OS_IsEmptyOrTrimEmpty = True: Exit Function
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    s = Trim$(s)
+    OS_IsEmptyOrTrimEmpty = (LenB(s) = 0)
+End Function
+
+
+Private Function OS_PosOfColInKeep(ByVal keepCols As Collection, ByVal colIdx As Long) As Long
+    Dim i As Long
+    For i = 1 To keepCols.Count
+        If CLng(keepCols(i)) = colIdx Then
+            OS_PosOfColInKeep = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+
+Private Sub OS_ThickBorder(ByVal rng As Range)
+    With rng.Borders(xlEdgeLeft): .LineStyle = xlContinuous: .Weight = xlThick: .Color = RGB(0, 0, 0): End With
+    With rng.Borders(xlEdgeRight): .LineStyle = xlContinuous: .Weight = xlThick: .Color = RGB(0, 0, 0): End With
+    With rng.Borders(xlEdgeTop): .LineStyle = xlContinuous: .Weight = xlThick: .Color = RGB(0, 0, 0): End With
+    With rng.Borders(xlEdgeBottom): .LineStyle = xlContinuous: .Weight = xlThick: .Color = RGB(0, 0, 0): End With
+End Sub
+
+
+Private Function OS_ReportZero(ByVal v As Long) As String
+    If v > 0 Then OS_ReportZero = "c" & CStr(v) Else OS_ReportZero = "нет"
+End Function
+
+
+' --- Текстовые сравнения/поиск для условий ---
+Private Function OS_EqualTextTrim(ByVal v As Variant, ByVal target As String) As Boolean
+    Dim s As String
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    s = Trim$(s)
+    OS_EqualTextTrim = (StrComp(s, target, vbTextCompare) = 0)
+End Function
+
+
+Private Function OS_TextContainsCI(ByVal v As Variant, ByVal token As String) As Boolean
+    Dim s As String
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    OS_TextContainsCI = (InStr(1, s, token, vbTextCompare) > 0)
+End Function
+
+
+Private Function OS_TextContainsSubstrCI(ByVal v As Variant, ByVal tokenSub As String) As Boolean
+    Dim s As String
+    On Error Resume Next: s = CStr(v): On Error GoTo 0
+    OS_TextContainsSubstrCI = (InStr(1, s, tokenSub, vbTextCompare) > 0)
+End Function
+
+
+'========================================================================================
+' НОВОЕ: логика допуска строки по "Протестировано?"
+'========================================================================================
+
+
+' 🧩 Имя «фичи», о которой можно просить: OS_TestedEligibleThisTest
+' True, если строку следует БРАТЬ: ячейка пустая ИЛИ содержит метку этого теста.
+Private Function OS_TestedEligibleThisTest(ByVal v As Variant) As Boolean
+    OS_TestedEligibleThisTest = OS_AcceptTestedCell(v, INCLUDE_OWN_MARKED, OWN_TEST_LABEL)
+End Function
+
+
+' Базовый хелпер: допускает пустые, а при includeOwn=True — и строки, где встречается ownLabel
+Private Function OS_AcceptTestedCell(ByVal v As Variant, ByVal includeOwn As Boolean, ByVal ownLabel As String) As Boolean
+    If OS_IsEmptyOrTrimEmpty(v) Then
+        OS_AcceptTestedCell = True
+        Exit Function
+    End If
+    If includeOwn Then
+        Dim s As String
+        On Error Resume Next: s = CStr(v): On Error GoTo 0
+        s = Trim$(s)
+        If LenB(s) > 0 Then
+            If InStr(1, s, ownLabel, vbTextCompare) > 0 Then
+                OS_AcceptTestedCell = True
+                Exit Function
+            End If
+        End If
+    End If
+End Function
+
+
+'========================================================================================
+' ЛОГИ
+'========================================================================================
+Private Sub LogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim ws As Worksheet, r As Long
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:B1").Value = Array("Дата/Время", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    stepT = Timer
+    LogWrite OS_NowStr() & vbTab & ">> " & stepName
+End Sub
+
+
+Private Sub EndStep()
+    LogWrite OS_NowStr() & vbTab & "<< " & currentStep & "  (" & Format$(Timer - stepT, "0.00") & " сек)"
+    currentStep = vbNullString
+End Sub
+
+
+Private Function OS_NowStr() As String
+    OS_NowStr = Format$(Now, "dd.mm.yyyy HH:nn")
+End Function

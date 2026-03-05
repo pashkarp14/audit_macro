@@ -1,0 +1,534 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:    modSvod_Holidays_RegisterFill
+' Версия:    2.2.0  (23.09.2025)
+'
+' Что нового vs 2.1.0:
+'   - FIX: безопасное чтение диапазонов. Для 1x1 Range.Value2 теперь принудительно
+'          приводится к массиву (1..1,1..1), чтобы исключить Type mismatch при доступе (r, c).
+'   - Доп. логи при lr=2/одиночных диапазонах.
+'
+' Назначение:
+'   Заполнить "Регистр" на листе "7. Праздники" суммой проводок из листов популяции
+'   ("Популяция праздники", "Популяция праздники_Ч…") по совпадению дня (dd.mm.yyyy).
+'
+' Ключевые моменты:
+'   - Без формул: расчёт в VBA и вставка значений — быстро и стабильно на 1e6+ строк.
+'   - Парсинг дат в популяции: число -> Format(CDate, "dd.mm.yyyy"); текст -> Left(…,10).
+'   - Парсинг "Сумма": учитываем неразрывные пробелы/локальные разделители.
+'   - Форматируем только область вставки; целые столбцы не трогаем.
+'   - Подробные логи на лист "Логи". Все процедуры логирования — Private.
+'========================================================================================
+
+
+Private Const MODULE_VERSION            As String = "2.2.0"
+Private Const LOG_SHEET                 As String = "Логи"
+
+
+' --- Свод: лист/якорь/структура
+Private Const SHEET_SVOD                As String = "7. Праздники"
+Private Const ANCHOR_COL_SVOD           As Long = 2
+Private Const ANCHOR_TEXT_SVOD          As String = "Свод проводок по праздничным дням>>>"
+Private Const HEADER_HEIGHT_SVOD        As Long = 1
+Private Const TOTAL_TEXT                As String = "Итого"
+
+
+' Позиции в своде относительно ANCHOR_COL_SVOD (стандарт: Дата | Кол-во | Сумма | Регистр | Отклонение)
+Private Const REL_DATE                  As Long = 0   ' Дата
+Private Const REL_REG                   As Long = 3   ' Регистр
+
+
+' --- Источники (готовая популяция этого теста)
+Private Const POP_DST_BASENAME          As String = "Популяция праздники"
+
+
+' --- Синонимы шапок в популяции (в т.ч. варианты "Сумма")
+Private Const HDR_DATE_SYNS             As String = "Дата|Дата операции|Дата проводки"
+Private Const HDR_SUM_SYNS              As String = "Сумма|Сумма абс|Сумма абс.|Сумма абсолютная|Сумма (абс)"
+
+
+' --- Формат чисел (на область вставки)
+Private Const NUM_FMT                   As String = "# ##0;-# ##0;-"
+
+
+' --- Предел логируемых колонок шапки источника
+Private Const LOG_HEADERS_MAXCOLS       As Long = 30
+
+
+'============================== ТОЧКА ВХОДА ====================================
+
+
+Public Sub Заполнить_Свод_Праздники_Регистр()
+    Dim t0 As Double: t0 = Timer
+    Call Private_EnvOff
+    On Error GoTo EH
+
+
+    Call Private_Log("Старт v" & MODULE_VERSION & " — Регистр: расчёт в VBA (без формул). Safe 2D reader для одиночных диапазонов.")
+
+
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim wsSvod As Worksheet: Set wsSvod = wb.Worksheets(SHEET_SVOD)
+
+
+    ' --- Найти блок свода
+    Dim anchorRow As Long
+    anchorRow = Private_FindAnchorExact(wsSvod, ANCHOR_COL_SVOD, ANCHOR_TEXT_SVOD)
+    If anchorRow = 0 Then Err.Raise 5, , "Не найден якорь '" & ANCHOR_TEXT_SVOD & "' на листе '" & SHEET_SVOD & "'."
+
+
+    Dim headerRow As Long: headerRow = anchorRow + 1
+    Dim dataTop As Long:   dataTop = headerRow + HEADER_HEIGHT_SVOD
+
+
+    Dim totalRow As Long
+    totalRow = Private_FindBelowExact(wsSvod, ANCHOR_COL_SVOD, TOTAL_TEXT, dataTop)
+    If totalRow = 0 Or totalRow <= dataTop Then Err.Raise 5, , "Не найдена метка 'Итого' ниже шапки."
+
+
+    Dim dataBottom As Long: dataBottom = totalRow - 1
+    If dataBottom < dataTop Then
+        Call Private_Log("Нет строк данных в своде — выход.")
+        GoTo Tidy
+    End If
+
+
+    ' --- Колонки "Дата" и "Регистр" в своде (по шапке с fallback)
+    Dim colDateSvod As Long, colRegSvod As Long
+    colDateSvod = Private_FindHeaderBySyn(wsSvod, headerRow, Split(HDR_DATE_SYNS, "|"), ANCHOR_COL_SVOD + REL_DATE)
+    If colDateSvod = 0 Then colDateSvod = ANCHOR_COL_SVOD + REL_DATE
+
+
+    colRegSvod = Private_FindHeaderBySyn(wsSvod, headerRow, Split("Регистр|Сумма регистр|Сумма (регистр)", "|"), ANCHOR_COL_SVOD + REL_REG)
+    If colRegSvod = 0 Then colRegSvod = ANCHOR_COL_SVOD + REL_REG
+
+
+    Call Private_Log("Свод: Дата=c" & colDateSvod & "; Регистр=c" & colRegSvod & _
+                     "; DataTop=" & dataTop & "; DataBottom=" & dataBottom)
+
+
+    ' --- Соберём источники
+    Dim srcSheets As Collection: Set srcSheets = Private_GetPopSheets(wb)
+    If srcSheets Is Nothing Or srcSheets.Count = 0 Then
+        Call Private_Log("Внимание: не найдены листы '" & POP_DST_BASENAME & "' — в 'Регистр' будет 0.")
+        wsSvod.Range(wsSvod.Cells(dataTop, colRegSvod), wsSvod.Cells(dataBottom, colRegSvod)).Value = 0
+        GoTo FinishOK
+    End If
+    Call Private_Log("Найдено источников популяции: " & srcSheets.Count)
+
+
+    ' --- Построим словарь: "dd.mm.yyyy" -> сумма
+    Dim agg As Object: Set agg = CreateObject("Scripting.Dictionary")
+    agg.CompareMode = vbTextCompare
+
+
+    Dim i As Long
+    Dim totalRead As Long, totalUsed As Long, totalBadDate As Long, totalBadSum As Long
+
+
+    For i = 1 To srcSheets.Count
+        Dim ws As Worksheet: Set ws = srcSheets(i)
+
+
+        Dim colDateSrc As Long, colSumSrc As Long, lr As Long
+        If Not Private_GetDateAndSum(ws, colDateSrc, colSumSrc, lr) Then
+            Call Private_Log("Пропуск '" & ws.Name & "': нет 'Дата' или 'Сумма'.")
+            Call Private_LogHeaders(ws, LOG_HEADERS_MAXCOLS)
+            GoTo NextSheet
+        End If
+
+
+        Call Private_Log("Источник: '" & ws.Name & "'  Дата=c" & colDateSrc & "  Сумма=c" & colSumSrc & "  lr=" & lr)
+        Call Private_LogHeaders(ws, LOG_HEADERS_MAXCOLS)
+
+
+        If lr >= 2 Then
+            Dim n As Long: n = lr - 1
+
+
+            ' Чтение как 2D-массивов (включая случай 1x1)
+            Dim arrD As Variant, arrS As Variant
+            arrD = Private_ReadRange2D(ws, 2, colDateSrc, lr, colDateSrc)
+            arrS = Private_ReadRange2D(ws, 2, colSumSrc,  lr, colSumSrc)
+
+
+            If n = 1 Then Call Private_Log("Источник '" & ws.Name & "': диапазоны 1x1 принудительно приведены к массивам.")
+
+
+            Dim r As Long
+            For r = 1 To n
+                Dim key As String: key = Private_ToDateKey(arrD(r, 1))
+                If LenB(key) = 0 Then
+                    totalBadDate = totalBadDate + 1
+                    GoTo NextR
+                End If
+
+
+                Dim ok As Boolean, v As Double
+                v = Private_ToDoubleSafe(arrS(r, 1), ok)
+                If Not ok Then
+                    totalBadSum = totalBadSum + 1
+                    GoTo NextR
+                End If
+
+
+                If agg.Exists(key) Then
+                    agg(key) = CDbl(agg(key)) + v
+                Else
+                    agg.Add key, CDbl(v)
+                End If
+                totalUsed = totalUsed + 1
+NextR:
+                totalRead = totalRead + 1
+            Next r
+        End If
+NextSheet:
+    Next i
+
+
+    ' Примеры ключей словаря
+    Call Private_Log("Агрегация: прочитано=" & totalRead & _
+                     "; использовано=" & totalUsed & _
+                     "; плохих дат=" & totalBadDate & _
+                     "; плохих сумм=" & totalBadSum & _
+                     "; уникальных ключей=" & agg.Count)
+    Call Private_Log_SampleDict agg, 5
+
+
+    ' --- Заполним "Регистр" значениями по словарю
+    Dim outRng As Range
+    Set outRng = wsSvod.Range(wsSvod.Cells(dataTop, colRegSvod), wsSvod.Cells(dataBottom, colRegSvod))
+
+
+    Dim m As Long: m = dataBottom - dataTop + 1
+    If m > 0 Then
+        Dim outArr() As Variant: ReDim outArr(1 To m, 1 To 1)
+        Dim rr As Long, hits As Long, misses As Long
+
+
+        For rr = 1 To m
+            Dim svodKey As String
+            svodKey = Private_ToDateKey(wsSvod.Cells(dataTop + rr - 1, colDateSvod).Value2)
+            If LenB(svodKey) > 0 And agg.Exists(svodKey) Then
+                outArr(rr, 1) = CDbl(agg(svodKey))
+                hits = hits + 1
+            Else
+                outArr(rr, 1) = 0#
+                misses = misses + 1
+            End If
+        Next rr
+
+
+        outRng.Value = outArr
+        outRng.NumberFormatLocal = NUM_FMT
+
+
+        Call Private_Log("Заполнение свода: попаданий=" & hits & "; промахов=" & misses & "; диапазон=" & outRng.Address(0, 0))
+    End If
+
+
+FinishOK:
+    Call Private_Log("Готово v" & MODULE_VERSION & _
+                     "; строк обработано=" & (dataBottom - dataTop + 1) & _
+                     "; время, сек=" & Format$(Timer - t0, "0.00"))
+    GoTo Tidy
+
+
+EH:
+    Call Private_Log("ОШИБКА [" & Err.Number & "]: " & Err.Description)
+
+
+Tidy:
+    Call Private_EnvOn
+End Sub
+
+
+'============================== ПОМОЩНИКИ ======================================
+
+
+' Возвращает 2D-массив (1..rows, 1..cols) даже если диапазон 1x1.
+Private Function Private_ReadRange2D(ByVal ws As Worksheet, _
+                                     ByVal r1 As Long, ByVal c1 As Long, _
+                                     ByVal r2 As Long, ByVal c2 As Long) As Variant
+    Dim rng As Range
+    Set rng = ws.Range(ws.Cells(r1, c1), ws.Cells(r2, c2))
+
+
+    Dim v As Variant
+    v = rng.Value2
+
+
+    If (r2 - r1 + 1) = 1 And (c2 - c1 + 1) = 1 Then
+        Dim outArr As Variant
+        ReDim outArr(1 To 1, 1 To 1)
+        outArr(1, 1) = v
+        Private_ReadRange2D = outArr
+    Else
+        Private_ReadRange2D = v
+    End If
+End Function
+
+
+' Листы популяции: базовый и части "_Ч…"
+Private Function Private_GetPopSheets(ByVal wb As Workbook) As Collection
+    Dim col As New Collection
+    Dim sh As Worksheet, nm As String, base As String
+    base = POP_DST_BASENAME
+    For Each sh In wb.Worksheets
+        nm = sh.Name
+        If nm = base Or Left$(nm, Len(base & "_Ч")) = base & "_Ч" Then
+            col.Add sh
+        End If
+    Next sh
+    Set Private_GetPopSheets = col
+End Function
+
+
+' На источнике находит Дата и Сумма + последний ряд по этим колонкам
+Private Function Private_GetDateAndSum(ByVal ws As Worksheet, _
+                                       ByRef colDate As Long, _
+                                       ByRef colSum As Long, _
+                                       ByRef lastRow As Long) As Boolean
+    Dim synDate() As String: synDate = Split(HDR_DATE_SYNS, "|")
+    Dim synSum()  As String: synSum  = Split(HDR_SUM_SYNS,  "|")
+
+
+    colDate = Private_FindHeaderBySyn(ws, 1, synDate, 0)
+    colSum  = Private_FindHeaderBySyn(ws, 1, synSum,  0)
+
+
+    If colDate = 0 Or colSum = 0 Then
+        Private_GetDateAndSum = False
+        Exit Function
+    End If
+
+
+    lastRow = Private_LastDataRowOnCols(ws, Array(colDate, colSum))
+    If lastRow < 2 Then lastRow = 2
+
+
+    Private_GetDateAndSum = True
+End Function
+
+
+' Поиск якоря точным совпадением в колонке
+Private Function Private_FindAnchorExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim f As Range
+    Set f = ws.Columns(col).Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        Private_FindAnchorExact = 0
+    Else
+        Private_FindAnchorExact = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+' Поиск "Итого" ниже minRow
+Private Function Private_FindBelowExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String, ByVal minRow As Long) As Long
+    Dim lastRow As Long: lastRow = ws.Rows.Count
+    Dim rng As Range, f As Range
+    Set rng = ws.Range(ws.Cells(minRow, col), ws.Cells(lastRow, col))
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        Private_FindBelowExact = 0
+    Else
+        Private_FindBelowExact = IIf(f.MergeCells, f.MergeArea.Row, f.Row)
+    End If
+End Function
+
+
+' Поиск заголовка по синонимам; fallbackCol — если не найдено (0 допустим)
+Private Function Private_FindHeaderBySyn(ByVal ws As Worksheet, ByVal headerRow As Long, _
+                                         ByVal syns As Variant, ByVal fallbackCol As Long) As Long
+    Dim lastCol As Long: lastCol = ws.Cells(headerRow, ws.Columns.Count).End(xlToLeft).Column
+    Dim j As Long, i As Long, head As String, key As String
+    For j = 1 To lastCol
+        head = Private_NormHdr(CStr(ws.Cells(headerRow, j).Value))
+        If head <> "" Then
+            For i = LBound(syns) To UBound(syns)
+                key = Private_NormHdr(CStr(syns(i)))
+                If head = key Then
+                    Private_FindHeaderBySyn = j
+                    Exit Function
+                End If
+            Next i
+        End If
+    Next j
+    Private_FindHeaderBySyn = fallbackCol
+End Function
+
+
+' Последняя непустая строка по набору колонок
+Private Function Private_LastDataRowOnCols(ByVal ws As Worksheet, ByVal cols As Variant) As Long
+    Dim lr As Long, j As Long, c As Long, lrj As Long
+    lr = 0
+    For j = LBound(cols) To UBound(cols)
+        c = CLng(cols(j))
+        If c > 0 Then
+            lrj = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+            If lrj > lr Then lr = lrj
+        End If
+    Next j
+    If lr < 2 Then lr = 2
+    Private_LastDataRowOnCols = lr
+End Function
+
+
+' Нормализация заголовка
+Private Function Private_NormHdr(ByVal s As String) As String
+    Dim nb As String: nb = Chr$(160)
+    s = Replace$(s, nb, " ")
+    s = Replace$(s, vbCr, " ")
+    s = Replace$(s, vbLf, " ")
+    s = Replace$(s, vbTab, " ")
+    s = Replace$(s, "ё", "е")
+    s = Replace$(s, "Ё", "Е")
+    s = LCase$(Trim$(s))
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    Private_NormHdr = s
+End Function
+
+
+' Ключ даты "dd.mm.yyyy" из значения (число/текст)
+Private Function Private_ToDateKey(ByVal v As Variant) As String
+    On Error GoTo Fallback
+
+
+    If IsError(v) Then Exit Function
+    If IsDate(v) Then
+        Private_ToDateKey = Format$(CDate(v), "dd.mm.yyyy")
+        Exit Function
+    End If
+
+
+    Dim s As String
+    s = CStr(v)
+    s = Trim$(s)
+    If LenB(s) = 0 Then Exit Function
+
+
+    ' Берём первые 10 символов как dd.mm.yyyy
+    If Len(s) >= 10 Then
+        Private_ToDateKey = Left$(s, 10)
+    End If
+    Exit Function
+Fallback:
+    Private_ToDateKey = ""
+End Function
+
+
+' Надёжное чтение числа (учёт неразрывных пробелов/десятичного разделителя)
+Private Function Private_ToDoubleSafe(ByVal v As Variant, ByRef ok As Boolean) As Double
+    On Error GoTo Fallback
+
+
+    ok = False
+    If IsError(v) Then Exit Function
+
+
+    If IsNumeric(v) Then
+        ok = True
+        Private_ToDoubleSafe = CDbl(v)
+        Exit Function
+    End If
+
+
+    Dim s As String, nb As String
+    s = CStr(v)
+    s = Trim$(s)
+    If LenB(s) = 0 Then Exit Function
+
+
+    nb = Chr$(160)
+    s = Replace$(s, nb, "")
+    s = Replace$(s, " ", "")
+    s = Replace$(s, ",", Application.International(xlDecimalSeparator))
+
+
+    Private_ToDoubleSafe = CDbl(s)
+    ok = True
+    Exit Function
+Fallback:
+    ok = False
+    Private_ToDoubleSafe = 0#
+End Function
+
+
+' Лог шапки источника (первые LOG_HEADERS_MAXCOLS колонок)
+Private Sub Private_LogHeaders(ByVal ws As Worksheet, ByVal maxCols As Long)
+    On Error Resume Next
+    Dim lastCol As Long: lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    Dim upto As Long: upto = IIf(lastCol > maxCols, maxCols, lastCol)
+    Dim j As Long, buf As String
+    buf = "Шапка '" & ws.Name & "': "
+    For j = 1 To upto
+        buf = buf & "[" & j & ":'" & CStr(ws.Cells(1, j).Value) & "'] "
+    Next j
+    If lastCol > upto Then buf = buf & "... (всего " & lastCol & " колонок)"
+    Call Private_Log(buf)
+End Sub
+
+
+' Лог примеров словаря: до N элементов "дата -> сумма"
+Private Sub Private_Log_SampleDict(ByVal d As Object, ByVal maxItems As Long)
+    On Error Resume Next
+    If d Is Nothing Then Exit Sub
+    Dim cnt As Long: cnt = d.Count
+    If cnt = 0 Then
+        Call Private_Log("Примеры словаря: (пусто)")
+        Exit Sub
+    End If
+    Dim i As Long, k As Variant, shown As Long
+    Dim msg As String: msg = "Примеры словаря (до " & maxItems & "): "
+    For Each k In d.Keys
+        msg = msg & "[" & CStr(k) & " -> " & Format$(CDbl(d(k)), "0.########") & "] "
+        shown = shown + 1
+        If shown >= maxItems Then Exit For
+    Next k
+    Call Private_Log(msg)
+End Sub
+
+
+'============================== ЛОГИ/ОКРУЖЕНИЕ =================================
+
+
+Private Sub Private_Log(ByVal msg As String)
+    Dim ws As Worksheet, r As Long
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(LOG_SHEET)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Дата/Время", "Источник/Версия", "Сообщение")
+    End If
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = "Svod_Reg v" & MODULE_VERSION
+    ws.Cells(r, 3).Value = msg
+End Sub
+
+
+Private Sub Private_EnvOff()
+    On Error Resume Next
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    On Error GoTo 0
+    Call Private_Log("Окружение: ScreenUpdating=False; Events=False; Alerts=False; Calc=Manual.")
+End Sub
+
+
+Private Sub Private_EnvOn()
+    On Error Resume Next
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+    Application.Calculation = xlCalculationAutomatic
+    On Error GoTo 0
+    Call Private_Log("Окружение восстановлено.")
+End Sub

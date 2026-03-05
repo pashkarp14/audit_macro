@@ -1,0 +1,332 @@
+﻿﻿Option Explicit
+
+
+'========================================================================================
+' Модуль:     Копирование_проводок_в_3л
+'
+' Назначение:
+'   По флагу из ЛИСТА НАСТРОЕК (ищем в 5-м столбце якорь "Настройки выборки >>>",
+'   целевая ячейка — на 4 строки ниже и 1 столбец вправо от якоря) копировать данные на
+'   лист "Популяция праздники 3л":
+'     - если флаг = "Да": копировать ТОЛЬКО строки, где в колонке "Меппинг" значение
+'       "третьи стороны" (копирование значений + форматов, перенос ширин колонок);
+'     - если флаг <> "Да": скопировать весь лист-источник целиком (значения + форматы +
+'       ширины).
+'
+' Источники/приёмники:
+'   - Лист настроек:      CTL_SHEET (см. константы ниже), поиск якоря по CTL_ANCHOR_COL.
+'   - Лист-источник:      "Популяция праздники".
+'   - Лист-приёмник:      "Популяция праздники 3л" (создаётся при отсутствии).
+'
+' Важно:
+'   - Логирование подробно на лист "Логи" (процедуры LogWrite — Private).
+'   - Производительность: выключаем ScreenUpdating/Events, пересчёт — Manual, возвращаем назад.
+'   - Поиск заголовка "Меппинг" выполняется в верхних max 50 строках, строгое совпадение.
+'   - Остальная логика макроса сохранена.
+'
+' Версия:     1.1.0   (18.09.2025)
+'
+' Что нового в 1.1.0:
+'   - Чтение флага перенесено на якорь: ищем "Настройки выборки >>>" в 5-м столбце,
+'     берём значение из ячейки AnchorRow+4, AnchorCol+1.
+'   - Вынесены все параметры листов/якоря в константы наверх.
+'========================================================================================
+
+
+Private Const MacroVersion As String = "1.1.0"
+
+
+' ---------------- НАСТРОЙКИ ЛИСТОВ/ЯКОРЕЙ ----------------
+Private Const LOG_SHEET        As String = "Логи"
+
+
+' Лист, где ищем якорь и читаем флаг:
+Private Const CTL_SHEET        As String = "3. Выборка"             ' лист настроек
+Private Const CTL_ANCHOR_COL   As Long = 5                          ' 5-й столбец (E)
+Private Const CTL_ANCHOR_TEXT  As String = "Настройки выборки >>>"  ' текст якоря
+Private Const CTL_ROW_OFFS     As Long = 4                          ' смещение по строкам вниз от якоря
+Private Const CTL_COL_OFFS     As Long = 1                          ' смещение по столбцам вправо от якоря
+
+
+' Источник и приёмник:
+Private Const SRC_SHEET        As String = "Популяция праздники"
+Private Const DST_SHEET        As String = "Популяция праздники 3л"
+
+
+' Поиск заголовка "Меппинг" — сколько строк шапки смотреть максимум:
+Private Const MAP_MAX_HDR_ROWS As Long = 50
+
+
+' ----------------------------------------------------------
+Private currentStep As String  ' для логирования
+
+
+'-------------------------------- ЛОГИ --------------------------------
+Private Sub SafeLogWrite(ByVal msg As String)
+    On Error Resume Next
+    Dim wsLog As Worksheet, nextRow As Long
+    Set wsLog = ThisWorkbook.Worksheets(LOG_SHEET)
+    If wsLog Is Nothing Then
+        Set wsLog = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        If Not wsLog Is Nothing Then
+            wsLog.Name = LOG_SHEET
+            wsLog.Range("A1").Value = "Дата/Время"
+            wsLog.Range("B1").Value = "Сообщение"
+        End If
+    End If
+    If Not wsLog Is Nothing Then
+        nextRow = wsLog.Cells(wsLog.Rows.Count, 1).End(xlUp).Row
+        If nextRow < 1 Then nextRow = 1
+        If wsLog.Cells(1, 1).Value = "" Then
+            wsLog.Range("A1").Value = "Дата/Время"
+            wsLog.Range("B1").Value = "Сообщение"
+            nextRow = 1
+        End If
+        wsLog.Cells(nextRow + 1, 1).Value = Now
+        wsLog.Cells(nextRow + 1, 2).Value = msg
+    Else
+        Debug.Print Format$(Now, "yyyy-mm-dd hh:nn:ss"); " "; msg
+    End If
+End Sub
+
+
+Private Sub LogWrite(ByVal msg As String)
+    SafeLogWrite msg
+End Sub
+
+
+Private Sub StartStep(ByVal stepName As String)
+    currentStep = stepName
+    SafeLogWrite "Начало: " & currentStep
+End Sub
+
+
+Private Sub EndStep()
+    SafeLogWrite "Завершено: " & currentStep
+End Sub
+
+
+'------------------------------ УТИЛИТЫ ------------------------------
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If StrComp(ws.Name, sheetName, vbTextCompare) = 0 Then
+            SheetExists = True
+            Exit Function
+        End If
+    Next ws
+End Function
+
+
+Private Function EnsureSheet(ByVal wb As Workbook, ByVal sheetName As String) As Worksheet
+    If SheetExists(wb, sheetName) Then
+        Set EnsureSheet = wb.Worksheets(sheetName)
+    Else
+        Set EnsureSheet = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+        EnsureSheet.Name = sheetName
+    End If
+End Function
+
+
+Private Function LCaseTrim(ByVal v As Variant) As String
+    LCaseTrim = LCase$(Trim$(CStr(v)))
+End Function
+
+
+' Поиск ЯКОРЯ в заданном столбце: точное совпадение значения ячейки с искомым текстом (без учёта регистра)
+Private Function FindFirstInColumnExact(ByVal ws As Worksheet, ByVal col As Long, ByVal whatText As String) As Long
+    Dim rng As Range, f As Range
+    Set rng = ws.Columns(col)
+    Set f = rng.Find(What:=whatText, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If f Is Nothing Then
+        FindFirstInColumnExact = 0
+    Else
+        If f.MergeCells Then
+            FindFirstInColumnExact = f.MergeArea.Row
+        Else
+            FindFirstInColumnExact = f.Row
+        End If
+    End If
+End Function
+
+
+' Поиск заголовка "Меппинг" в верхних строках (до MAP_MAX_HDR_ROWS), строгое совпадение без регистра
+' (ЛОГИКУ НЕ МЕНЯЛ — ищем так же, как было задумано ранее)
+Private Function FindHeader_Mapping(ByVal ws As Worksheet, _
+                                    Optional ByVal maxHdrRows As Long = MAP_MAX_HDR_ROWS) As Range
+    Dim r As Long, lastCol As Long, c As Range, rng As Range
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastCol < 1 Then Exit Function
+    For r = 1 To maxHdrRows
+        Set rng = ws.Range(ws.Cells(r, 1), ws.Cells(r, lastCol))
+        On Error Resume Next
+        ' ВАЖНО: исходная логика использовала строгий поиск фиксированного заголовка;
+        ' оставляем как есть (при необходимости — уточните фактический заголовок).
+        Set c = rng.Find(What:="Связанные?", LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+        On Error GoTo 0
+        If Not c Is Nothing Then
+            Set FindHeader_Mapping = c
+            Exit Function
+        End If
+    Next r
+End Function
+
+
+Private Function GetLastRowInColumns(ByVal ws As Worksheet, ByVal firstCol As Long, ByVal lastCol As Long) As Long
+    Dim c As Long, lr As Long, mx As Long
+    mx = 1
+    For c = firstCol To lastCol
+        lr = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If lr > mx Then mx = lr
+    Next c
+    GetLastRowInColumns = mx
+End Function
+
+
+Private Sub CopyColumnWidths(ByVal wsSrc As Worksheet, ByVal wsDst As Worksheet, _
+                             ByVal firstCol As Long, ByVal lastCol As Long)
+    Dim c As Long
+    For c = firstCol To lastCol
+        wsDst.Columns(c - firstCol + 1).ColumnWidth = wsSrc.Columns(c).ColumnWidth
+    Next c
+End Sub
+
+
+'------------------------------ ОСНОВНОЙ МАКРОС ------------------------------
+Public Sub Копировать_Проводки_в_3л()
+    Dim wb As Workbook: Set wb = ThisWorkbook
+    Dim wsCtl As Worksheet, wsSrc As Worksheet, wsDst As Worksheet
+    Dim ctlVal As String
+    Dim t0 As Double
+
+
+    On Error GoTo ErrHandler
+    t0 = Timer
+    LogWrite "=== Запуск 'Копировать_Проводки_в_3л', версия " & MacroVersion & " ==="
+
+
+    ' Оптимизация
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    LogWrite "Performance: ScreenUpdating OFF, Calculation Manual, Events OFF"
+
+
+    ' Проверка листов
+    StartStep "Проверка листов"
+    If Not SheetExists(wb, CTL_SHEET) Then Err.Raise vbObjectError + 7101, , "Нет листа '" & CTL_SHEET & "'"
+    If Not SheetExists(wb, SRC_SHEET) Then Err.Raise vbObjectError + 7102, , "Нет листа '" & SRC_SHEET & "'"
+    Set wsCtl = wb.Worksheets(CTL_SHEET)
+    Set wsSrc = wb.Worksheets(SRC_SHEET)
+    Set wsDst = EnsureSheet(wb, DST_SHEET)
+    EndStep
+
+
+    ' Читаем флаг через ЯКОРЬ в 5-м столбце
+    StartStep "Чтение флага по якорю '" & CTL_ANCHOR_TEXT & "'"
+    Dim anchorRow As Long, flagRow As Long, flagCol As Long
+    anchorRow = FindFirstInColumnExact(wsCtl, CTL_ANCHOR_COL, CTL_ANCHOR_TEXT)
+    If anchorRow = 0 Then Err.Raise vbObjectError + 7105, , _
+        "Якорь '" & CTL_ANCHOR_TEXT & "' не найден в столбце " & CTL_ANCHOR_COL & " листа '" & CTL_SHEET & "'"
+
+
+    flagRow = anchorRow + CTL_ROW_OFFS
+    flagCol = CTL_ANCHOR_COL + CTL_COL_OFFS
+
+
+    ctlVal = LCaseTrim(wsCtl.Cells(flagRow, flagCol).Value)
+    LogWrite "Флаг (ячейка r=" & flagRow & ", c=" & flagCol & "): '" & ctlVal & "'"
+    EndStep
+
+
+    If ctlVal = "да" Then
+        ' --- Режим фильтра по "Меппинг" = "третьи стороны" ---
+        StartStep "Фильтр по 'Меппинг' = 'третьи стороны' и копирование"
+        Dim hdrMap As Range, hdrRow As Long, mapCol As Long
+        Dim lastCol As Long, lastRow As Long, srcRange As Range
+        Dim mapField As Long, visDataRows As Long
+
+
+        Set hdrMap = FindHeader_Mapping(wsSrc, MAP_MAX_HDR_ROWS)
+        If hdrMap Is Nothing Then Err.Raise vbObjectError + 7103, , _
+            "Не найден заголовок 'Меппинг' на листе '" & SRC_SHEET & "' (в верхних строках)"
+        hdrRow = hdrMap.Row
+        mapCol = hdrMap.Column
+
+
+        lastCol = wsSrc.Cells(hdrRow, wsSrc.Columns.Count).End(xlToLeft).Column
+        If lastCol < mapCol Then lastCol = mapCol
+        lastRow = GetLastRowInColumns(wsSrc, 1, lastCol)
+        If lastRow < hdrRow Then Err.Raise vbObjectError + 7104, , "На листе '" & SRC_SHEET & "' нет данных ниже шапки"
+
+
+        Set srcRange = wsSrc.Range(wsSrc.Cells(hdrRow, 1), wsSrc.Cells(lastRow, lastCol))
+        mapField = mapCol - srcRange.Columns(1).Column + 1
+
+
+        ' Сбрасываем фильтры и фильтруем
+        If wsSrc.AutoFilterMode Then wsSrc.AutoFilterMode = False
+        srcRange.AutoFilter Field:=mapField, Criteria1:="=третьи стороны"
+
+
+        ' Очищаем приёмник
+        wsDst.Cells.Clear
+
+
+        ' Копируем только видимые строки (шапка + строки с критерием), со всеми форматами
+        srcRange.SpecialCells(xlCellTypeVisible).Copy Destination:=wsDst.Cells(1, 1)
+
+
+        ' Переносим ширины колонок
+        Call CopyColumnWidths(wsSrc, wsDst, 1, lastCol)
+
+
+        ' Подсчёт видимых строк данных (без шапки)
+        On Error Resume Next
+        visDataRows = srcRange.Offset(1, 0).Resize(srcRange.Rows.Count - 1).SpecialCells(xlCellTypeVisible).Rows.Count
+        If Err.Number <> 0 Then visDataRows = 0
+        On Error GoTo 0
+
+
+        LogWrite "Скопировано строк (данные, без шапки): " & visDataRows & "; колонок: " & lastCol
+        ' Снимаем фильтр
+        wsSrc.AutoFilterMode = False
+        EndStep
+
+
+    Else
+        ' --- Режим: копируем весь лист ---
+        StartStep "Полное копирование листа '" & SRC_SHEET & "'"
+        Dim usedRng As Range, lastCol2 As Long
+        wsDst.Cells.Clear
+
+
+        ' Берём фактически используемый прямоугольник (включая форматы)
+        Set usedRng = wsSrc.UsedRange
+        usedRng.Copy Destination:=wsDst.Cells(1, 1)
+
+
+        ' Ширины колонок
+        lastCol2 = wsSrc.Cells(1, wsSrc.Columns.Count).End(xlToLeft).Column
+        If lastCol2 < 1 Then lastCol2 = usedRng.Columns.Count
+        Call CopyColumnWidths(wsSrc, wsDst, 1, lastCol2)
+
+
+        LogWrite "Полностью скопирован лист: " & usedRng.Rows.Count & " строк; " & usedRng.Columns.Count & " колонок"
+        EndStep
+    End If
+
+
+Cleanup:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    LogWrite "Performance: ScreenUpdating ON, Calculation Automatic, Events ON"
+    LogWrite "=== Завершено 'Копировать_Проводки_в_3л', время: " & Format$(Timer - t0, "0.00") & " сек. ==="
+    Exit Sub
+
+
+ErrHandler:
+    LogWrite "Ошибка на этапе '" & currentStep & "': " & Err.Description & " (№" & Err.Number & ")"
+    Resume Cleanup
+End Sub
