@@ -2,17 +2,27 @@
 
 ## Надстройка Excel `Аудиторам`
 - Если задача касается корпоративной Excel-надстройки, вкладки `Аудиторам`, папок `addin/` или `addin_updater/`, сборки `AuditAddin.xlam` или обновления самой надстройки, обязательно сначала использовать отдельную инструкцию: `_publish/audit-macros-private/docs/addin-agent-instructions.md`.
+- Если задача касается обычного updater-а макросов рабочих книг, который подтягивает `shared/*.bas` и `profiles/<profile>/*.bas`, а также его переключения между `Dev` и `Company/Work`, обязательно сначала использовать `_publish/audit-macros-private/docs/macro-updater-agent-instructions.md`.
 - Если задача касается конструктора РД внутри надстройки, смешанного комплекта `Excel + Word`, шаблонов РД или генерации рабочих документов из файла `Анализ существенных статей`, после `addin-agent-instructions.md` использовать `_publish/audit-macros-private/docs/rd-constructor-agent-instructions.md`.
 - Надстройка является отдельной функциональной линией, а не профилем. Для нее не применять правила `profiles/<profile>/` по умолчанию и не создавать `profiles/addin/`.
 - Если задача касается переключения надстройки между `Dev` и `Company/Work`, использовать раздел `Как переключать режимы` из `_publish/audit-macros-private/docs/addin-agent-instructions.md` как основной runbook.
 - Если меняются кнопки, меню или пользовательские сценарии вкладки `Аудиторам`, вместе с кодом обязательно обновлять встроенную инструкцию внутри надстройки.
 - Если в надстройке появляется новая кнопка или новое крупное меню, для них обязательно находить или генерить подходящую по смыслу и стилю картинку и встраивать ее в Ribbon-пакет.
 - Для надстройки поддерживать одну основную dev-версию и релизить рабочую версию только из нее по уже зафиксированным правилам.
-- Если изменения надстройки должны дойти до dev-версии с Git updater, недостаточно оставить их локально: после проверок нужно обновить `addin/release/*`, закоммитить и запушить актуальное состояние в `main` репозитория `_publish/audit-macros-private`.
-- Для надстройки считать релизные каналы раздельными: `addin/release/AuditAddin.xlam` - это dev Git runtime без VBA-защиты, а защищенные company-пакеты лежат в `addin/release/company/`.
+- Для надстройки считать, что `Dev` и `Company` отличаются только упаковкой и доставкой: `Dev` - это безопасный runtime без VBA-пароля, без `Loader` и без `Setup`; `Company` - это тот же безопасный runtime под VBA-паролем плюс `Loader` и `Setup`.
+- Для надстройки считать, что все ограничения безопасности `Company` действуют и для `Dev`: не использовать интернет, Git как источник обновления, `WScript.Shell`, `Shell(...)`, `powershell.exe`, `cmd.exe`, `curl`, `ExecutionPolicy Bypass`, HTTP-клиенты, Outlook send, а также VBA-механизмы удаления и перемещения файлов и папок вроде `Kill`, `RmDir`, `DeleteFile`, `DeleteFolder`, `MoveFile`, `MoveFolder`, `Name old As new`.
+- Для надстройки разрешать только безопасную локальную файловую работу, нужную для сценария add-in: `FileExists`, `FolderExists`, `GetParentFolderName`, `GetFileName`, `CreateFolder`, `CopyFile` в контролируемых сценариях, `ADODB.Stream`, `OpenTextFile`, `Workbooks.Open`, `Workbook.SaveAs`, запись локального конфига, логов и служебных файлов конструктора РД. `Shell.Application` разрешен только как диалог выбора папки через `BrowseForFolder`.
+- Для этой рабочей машины после обычных изменений в надстройке нужно вручную поставить пользователю свежую dev-версию через `addin/build/Install-AuditAddin.ps1` из `addin/release/`, а затем уже закоммитить и запушить актуальное состояние в `main` репозитория `_publish/audit-macros-private`.
+- Для этой рабочей машины считать, что пользователь заранее разрешил закрывать любой `EXCEL.EXE`, если это нужно для сборки, smoke-тестов, установки, переключения режима или повторной загрузки dev-надстройки. Дополнительное согласование на закрытие Excel не требуется.
+- Для надстройки считать релизные каналы раздельными: `addin/release/AuditAddin.xlam` - это основной dev runtime без VBA-защиты, а `addin/release/company/` - это защищенный company-набор с `AuditAddin.xlam`, `AuditAddinLoader.xlam` и `AuditAddinSetup.xlam`.
 - Company-пакеты не пересобирать автоматически при каждом изменении dev-версии: собирать `addin/release/company/` только когда пользователь прямо попросил company-release.
-- По умолчанию после обычных изменений в dev-версии собирать, проверять, коммитить и пушить только dev Git-пакет из `addin/release/`. `publish-company-addin-release.ps1` и обновление `addin/release/company/` не запускать без прямой команды пользователя.
+- По умолчанию после обычных изменений в dev-версии собирать, проверять, обновлять `addin/release/`, вручную ставить свежую dev-надстройку на этот компьютер, коммитить и пушить только dev-пакет из `addin/release/`. `publish-company-addin-release.ps1` и обновление `addin/release/company/` не запускать без прямой команды пользователя.
+- Для надстройки считать правилом, что любые завершенные изменения нужно фиксировать в Git: после работы коммитить и пушить свои изменения в репозиторий `_publish/audit-macros-private`, если пользователь явно не попросил не пушить. В коммит не включать чужие или нерелевантные локальные хвосты.
+- Для add-in runtime считать обязательной проверку чистоты пакета: и в dev-пакете `addin/release/AuditAddin.xlam`, и в company-пакетах `addin/release/company/*.xlam` не должно быть dev-хвостов и запрещенных shell/Git/network/delete/move-маркеров вроде `modAddinUpdaterDev`, `GitFirst`, `GitEnabled=Yes`, `powershell.exe`, `cmd.exe`, `wscript.exe`, `WScript.Shell`, `Shell(`, `ExecutionPolicy Bypass`, `git clone/fetch/checkout/pull`, `MSXML2.XMLHTTP`, `MSXML2.ServerXMLHTTP`, `WinHttp.WinHttpRequest.5.1`, `Kill`, `RmDir`, `DeleteFile`, `DeleteFolder`, `MoveFile`, `MoveFolder`.
+- Для company-release, если в сценарии появляется новый путь к файлу или папке и пользователь его явно не указал, агент обязан сначала спросить этот путь у пользователя. Нельзя придумывать новый сетевой или локальный путь по аналогии и нельзя молча менять уже согласованный путь.
+- `addin_updater/tests/smoke-test.ps1` не считать частью обязательного цикла разработки надстройки. Гонять его только когда задача прямо затрагивает `addin_updater/` или company/work-механику доставки.
 - Сборки и тесты вида `no-updater` и `diagnostic` считать obsolete-хвостами: не использовать, не восстанавливать и не развивать без прямого запроса пользователя.
+- Локальный путь для company-релизов: `_publish/audit-macros-private/addin/release/company/`. При каждом новом company-release старые файлы переносить в `_publish/audit-macros-private/addin/release/company/archive/`, создавая подпапку с версией (например, `archive/2026.04.19.092456/`). В самой папке `company/` хранить только актуальную сборку.
 
 ## Общие правила
 - Каждый новый диалог считать вне контекста прошлых обсуждений, если пользователь явно не сказал обратное.
@@ -32,6 +42,14 @@
 - Updater автоматически подтягивает все `shared/*.bas`.
 - Если в книге указан `Profile`, updater автоматически подтягивает все `profiles/<profile>/*.bas`.
 - В `Profile` можно указывать несколько папок профилей через `,` или `;`.
+- `shared/*.bas` и `profiles/<profile>/*.bas` поддерживать одной общей кодовой базой без отдельных dev/company-вариантов модулей: эти макросы все равно попадают в company-релиз, поэтому писать их сразу по company-ограничениям.
+- Для company/work-режима обычного updater-а не использовать интернет и Git как источник обновления: макросы должны браться из согласованной сетевой папки через локальное зеркало `._macro_repo` по правилам из `macro-updater-agent-instructions.md`.
+- Локальный путь для company-релизов обычных макросов: `_publish/audit-macros-private/macro_updater/release/company/`. При каждом новом company-release старые файлы переносить в `_publish/audit-macros-private/macro_updater/release/company/archive/`, создавая подпапку с версией (например, `archive/2026.04.20.101500/`). В самой папке `company/` хранить только актуальный пакет: `shared/`, `profiles/` и рабочую `*.xlsm`-книгу со встроенным updater-ом.
+- У обычного updater-а поддерживать две runtime-версии:
+  - `macro_updater/modMacroUpdater.bas` — dev runtime с Git-first логикой для разработки.
+  - `macro_updater/modMacroUpdaterCompany.bas` — company runtime только для `Network/Local`, без Git/shell-кода.
+- `*.xlsm` со встроенным company-updater-ом пересобирать только когда меняется сам updater runtime или стартовая книга. Если меняются только `shared/*.bas` и `profiles/<profile>/*.bas`, для уже выданной company-книги достаточно обновить содержимое сетевой папки.
+- Пока ordinary `macro_updater` должен сам импортировать обновленные `shared/*.bas` и `profiles/<profile>/*.bas`, company `*.xlsm`-книга обязана оставаться без VBA-защиты. VBA-защиту для этой книги можно включать только для финального замороженного пакета, когда self-update больше не нужен, или после отдельной смены архитектуры.
 
 ## Обязательное уточнение перед созданием модуля
 - Перед добавлением нового `*.bas` обязательно уточнять у пользователя, куда именно его класть:
