@@ -1,121 +1,121 @@
-# Excel Activity Logs Design
+# Дизайн системы логов Excel
 
-Date: 2026-06-29
+Дата: 2026-06-29
 
-Status: design approved in chat, pending spec review and implementation plan.
+Статус: дизайн согласован в чате, ожидает плана реализации.
 
-## Context
+## Контекст
 
-The corporate Excel add-in `Аудиторам` should track which workbooks are opened, saved, and still active, without making Excel slower or less reliable.
+Корпоративная Excel-надстройка `Аудиторам` должна отслеживать, кто открывает, сохраняет и продолжает держать открытыми рабочие книги. При этом логирование не должно замедлять Excel, подвешивать закрытие книг или оставлять невидимые процессы Excel.
 
-An earlier centralized workbook approach is risky for roughly 100 users because many Excel instances can try to write to the same `.xlsx` at the same time. The previous logger also relied on delayed `Application.OnTime` work around close events, which can leave Excel hanging if the application exits before the timer chain finishes.
+Схема с одной общей центральной книгой для записи рискованна примерно для 100 пользователей: несколько Excel-процессов могут одновременно пытаться писать в один `.xlsx`. Старый подход также опирался на отложенные `Application.OnTime`-таймеры вокруг закрытия книг, а это опасно: если Excel закрывается раньше, чем таймер отработал, можно получить зависание.
 
-The add-in runtime must obey the existing safety rules:
+Runtime-код надстройки обязан соблюдать текущие правила безопасности:
 
-- no internet, Git, shell, PowerShell, command prompt, or external hidden process calls;
-- no VBA delete or move operations such as `Kill`, `RmDir`, `DeleteFile`, `DeleteFolder`, `MoveFile`, `MoveFolder`, or `Name old As new`;
-- background services must fail fast and silently when paths are missing or unavailable;
-- user-facing Excel must keep working even when logging cannot write.
+- не использовать интернет, Git, shell, PowerShell, командную строку или скрытые внешние процессы;
+- не использовать VBA-операции удаления и перемещения: `Kill`, `RmDir`, `DeleteFile`, `DeleteFolder`, `MoveFile`, `MoveFolder`, `Name old As new`;
+- фоновые сервисы должны быстро и тихо завершаться, если путь пустой, битый или недоступный;
+- пользовательский Excel должен продолжать работать, даже если лог записать не удалось.
 
-## Goals
+## Цели
 
-- Keep a historical event journal for workbook activity.
-- Avoid simultaneous writes to one central workbook.
-- Support about 100 users with one user per computer.
-- Let the add-in write logs safely while Excel is in normal use.
-- Provide an admin-friendly central workbook for viewing, filtering, deduplication, and reporting.
-- Support dev testing on this machine with the same storage shape as company/work.
+- Вести исторический журнал событий по рабочим книгам.
+- Убрать одновременную запись многих пользователей в одну центральную книгу.
+- Поддержать ориентировочно 100 пользователей, где на каждом компьютере работает один основной пользователь.
+- Дать надстройке безопасный способ писать логи во время обычной работы Excel.
+- Дать отдельную центральную admin-книгу для просмотра, фильтрации, дедупликации и отчетов.
+- Сделать dev-имитацию хранилища на этой машине с той же структурой, что и в company/work.
 
-## Non-Goals
+## Не Цели
 
-- Do not physically delete, move, archive, or rotate old logs from the add-in.
-- Do not add visible logging controls to the normal `Аудиторам` Ribbon.
-- Do not block workbook open, save, or close while waiting for the log store.
-- Do not guarantee exact close timestamps; close time is inferred from heartbeat state.
+- Надстройка не удаляет, не перемещает, не архивирует и не ротирует старые логи.
+- Не добавляем обычным пользователям видимые кнопки логгера на вкладку `Аудиторам`.
+- Не блокируем открытие, сохранение или закрытие книги ожиданием лог-хранилища.
+- Не обещаем точное время закрытия книги до секунды. Закрытие определяется приблизительно через heartbeat.
 
-## Recommended Architecture
+## Рекомендуемая Архитектура
 
-Use per-computer append logs plus a separate central admin reader.
+Используем схему: локальный журнал на каждом компьютере плюс отдельная центральная книга просмотра.
 
-Each add-in runtime writes activity events to its own local spool and, when possible, appends unsynced rows to a network TSV file dedicated to that computer and month. Since each computer writes only its own file, there is no normal contention between users.
+Каждая установленная надстройка пишет события в локальный spool и, когда может, дописывает еще не выгруженные строки в сетевой TSV-файл своего компьютера за текущий месяц. Так как каждый компьютер пишет только в свой файл, обычной конкуренции между пользователями нет.
 
-The central workbook is not part of the user runtime path. When an admin opens or refreshes it, it reads all available per-computer TSV files, imports raw events, deduplicates by `EventId`, and builds reporting tables.
+Центральная книга не участвует в пользовательском runtime. Когда админ открывает или обновляет эту книгу, она читает все доступные компьютерные TSV-файлы, импортирует события, убирает дубли по `EventId` и строит отчеты.
 
-This separates the two concerns:
+Разделяем две ответственности:
 
-- user add-in: collect events with minimal risk;
-- central workbook: analyze history when someone intentionally opens it.
+- пользовательская надстройка - безопасно собирает события;
+- центральная книга - анализирует историю, когда ее специально открыли.
 
-## Storage Layout
+## Структура Хранилища
 
-Company/work network store:
+Company/work сетевое хранилище:
 
 ```text
 NetworkAssetsRoot\_system\activity-logs\computers\
 ```
 
-Expected company root from the current runbook:
+Ожидаемый company-путь из текущего runbook:
 
 ```text
 Z:\Project\DAVK\Оборудование\Addins\assets\_system\activity-logs\computers\
 ```
 
-Dev simulation on this computer:
+Dev-имитация на этой машине:
 
 ```text
 %APPDATA%\AuditAddin\assets\_system\activity-logs\computers\
 ```
 
-Local spool on each computer:
+Локальный spool на каждом компьютере:
 
 ```text
 %APPDATA%\AuditAddin\activity-log\spool\
 ```
 
-Local sync state:
+Локальное состояние синхронизации:
 
 ```text
 %APPDATA%\AuditAddin\activity-log\state\
 ```
 
-Per-computer monthly network file name:
+Имя месячного сетевого файла компьютера:
 
 ```text
 <MachineName>__YYYY-MM.tsv
 ```
 
-Example:
+Пример:
 
 ```text
 AUDIT-PC-17__2026-06.tsv
 ```
 
-Because there is one user per computer, `MachineName` is the primary file partition. User fields still stay in the rows for reporting and diagnostics.
+Так как на одном компьютере обычно один пользователь, основное разбиение идет по `MachineName`. Поля пользователя все равно остаются в строках для отчетов и диагностики.
 
-## Retention
+## Хранение И Очистка
 
-The add-in does not delete or move old log files.
+Надстройка не удаляет и не перемещает старые файлы логов.
 
-Monthly files remain in the folder until a human removes them manually. The central workbook imports all available TSV files by default. Period filtering is a viewer/reporting concern, not an enforced retention rule.
+Месячные файлы остаются в папке, пока человек не удалит их руками. Центральная книга по умолчанию импортирует все доступные TSV-файлы. Фильтр по периоду - это настройка просмотра и отчетов, а не жесткое правило хранения.
 
-## Event Types
+## Типы Событий
 
-The event stream should use these primary event types:
+Основные типы событий:
 
-- `SESSION_START`: the add-in logging service started in this Excel session.
-- `OPEN`: a saved user workbook was seen open.
-- `SAVE`: a user workbook was saved successfully.
-- `SEEN`: heartbeat confirming a workbook was still open.
-- `MISSING`: the logger previously tracked the workbook but no longer sees it.
-- `SESSION_END_ATTEMPT`: Excel or the add-in began shutdown handling.
-- `FLUSH_OK`: local rows were appended to the network per-computer log.
-- `FLUSH_SKIP`: flush was skipped because the network store was unavailable or unsafe.
+- `SESSION_START`: сервис логирования запустился в этой сессии Excel.
+- `OPEN`: сохраненная пользовательская книга замечена открытой.
+- `SAVE`: пользовательская книга успешно сохранена.
+- `SEEN`: heartbeat подтверждает, что книга все еще открыта.
+- `MISSING`: книга раньше отслеживалась, а теперь ее больше не видно.
+- `SESSION_END_ATTEMPT`: Excel или надстройка начали закрытие.
+- `FLUSH_OK`: локальные строки дописаны в сетевой лог компьютера.
+- `FLUSH_SKIP`: выгрузка пропущена, потому что сетевое хранилище недоступно или небезопасно.
 
-The central reports can hide technical event types by default while keeping them in `RawEvents`.
+Центральные отчеты могут скрывать технические события по умолчанию, но в `RawEvents` они должны сохраняться.
 
-## Event Fields
+## Поля Событий
 
-Each row should be a TSV record with a stable header:
+Каждая строка TSV должна иметь стабильный набор колонок:
 
 ```text
 EventId
@@ -137,179 +137,179 @@ SourcePath
 Notes
 ```
 
-`EventId` must be unique and stable enough for central deduplication. A safe shape is:
+`EventId` нужен для дедупликации в центральной книге. Безопасная схема:
 
 ```text
 MachineName + ExcelSessionId + sequence number
 ```
 
-`WorkbookSessionId` identifies one observed open period for one workbook. It should include the Excel session, normalized workbook path, and first observed open time.
+`WorkbookSessionId` обозначает один период открытия одной книги. Он должен включать сессию Excel, нормализованный путь книги и первое время, когда книга была замечена открытой.
 
-Before writing a TSV row, all text fields must be sanitized in one helper:
+Перед записью TSV-строки все текстовые поля должны проходить через один helper:
 
-- replace tabs with a single space;
-- replace CR/LF line breaks with a single space;
-- trim only control characters that would break the row structure;
-- keep Russian text and normal file path characters intact.
+- табы заменяются на один пробел;
+- CR/LF-переносы строк заменяются на один пробел;
+- удаляются только управляющие символы, которые ломают структуру строки;
+- русский текст и обычные символы путей сохраняются.
 
-This keeps the file append-only and parser-friendly without introducing a CSV quoting dialect.
+Так файл остается простым append-only TSV без сложной CSV-логики кавычек.
 
-## Runtime Logging Behavior
+## Поведение Runtime-Логгера
 
-On startup:
+При старте:
 
-- create an `ExcelSessionId`;
-- initialize in-memory tracking;
-- append `SESSION_START` to the local spool;
-- schedule lightweight heartbeat only if there are trackable user workbooks.
+- создать `ExcelSessionId`;
+- инициализировать in-memory tracking;
+- записать `SESSION_START` в локальный spool;
+- запланировать легкий heartbeat только если есть отслеживаемые пользовательские книги.
 
-On workbook open:
+При открытии книги:
 
-- ignore the add-in, the central viewer, log files, and unsaved workbooks with no path;
-- append `OPEN` to the local spool;
-- remember the workbook in memory.
+- игнорировать саму надстройку, центральную книгу просмотра, лог-файлы и несохраненные книги без пути;
+- записать `OPEN` в локальный spool;
+- запомнить книгу в памяти.
 
-On successful save:
+При успешном сохранении:
 
-- append `SAVE` to the local spool;
-- update the in-memory last write snapshot.
+- записать `SAVE` в локальный spool;
+- обновить in-memory снимок последнего сохранения.
 
-On heartbeat:
+При heartbeat:
 
-- run rarely, with a default interval of 5 minutes;
-- enumerate currently open user workbooks;
-- append `SEEN` for tracked open workbooks;
-- append `MISSING` for previously tracked workbooks that are no longer visible;
-- attempt a short non-blocking flush from local spool to that computer's monthly network TSV.
+- запускать редко, по умолчанию раз в 5 минут;
+- быстро перечислить открытые пользовательские книги;
+- записать `SEEN` для отслеживаемых открытых книг;
+- записать `MISSING` для книг, которые раньше отслеживались, а теперь не видны;
+- попробовать короткую неблокирующую выгрузку из локального spool в месячный TSV этого компьютера.
 
-On workbook close or add-in shutdown:
+При закрытии книги или надстройки:
 
-- do not open, create, save, or modify any central workbook;
-- do not do heavy network work;
-- cancel scheduled timers where possible;
-- append only a local lightweight event if it can be done safely;
-- allow Excel to close even if logging fails.
+- не открывать, не создавать, не сохранять и не менять центральную книгу;
+- не делать тяжелую сетевую работу;
+- по возможности отменить запланированные таймеры;
+- записать только легкое локальное событие, если это безопасно;
+- дать Excel закрыться даже при ошибке логирования.
 
-## Network Flush Behavior
+## Выгрузка В Сеть
 
-The local spool is the durable source for rows produced by that machine. The network monthly TSV is the shared collection point for central reporting.
+Локальный spool - это устойчивый источник строк, созданных на конкретной машине. Месячный сетевой TSV - это точка сбора для центральной отчетности.
 
-Flush should:
+Выгрузка должна:
 
-- resolve the network log folder from `NetworkAssetsRoot` in company/work;
-- use the dev simulation folder when running in dev on this computer;
-- create the target folder if it does not exist;
-- append only rows that have not already been flushed according to local sync state;
-- write only to the current computer's current month file;
-- skip quickly if the folder is unavailable, the file is read-only, or the path is not configured;
-- record `FLUSH_OK` or `FLUSH_SKIP` locally for diagnostics.
+- получать сетевую папку логов из `NetworkAssetsRoot` в company/work;
+- использовать dev-имитацию на этой машине в dev;
+- создавать целевую папку, если ее нет;
+- дописывать только строки, которые еще не выгружены по локальному sync-state;
+- писать только в файл текущего компьютера за текущий месяц;
+- быстро пропускаться, если папка недоступна, файл read-only или путь не настроен;
+- локально записывать `FLUSH_OK` или `FLUSH_SKIP` для диагностики.
 
-Flush must not:
+Выгрузка не должна:
 
-- delete, move, rename, archive, or truncate any log file;
-- open or save a central workbook;
-- show `MsgBox`;
-- block Excel shutdown.
+- удалять, перемещать, переименовывать, архивировать или обрезать лог-файлы;
+- открывать или сохранять центральную книгу;
+- показывать `MsgBox`;
+- блокировать закрытие Excel.
 
-## Central Admin Workbook
+## Центральная Admin-Книга
 
-Create a separate admin `.xlsm` workbook for reading and reporting logs. It should not be a visible command for normal users on the `Аудиторам` Ribbon.
+Нужна отдельная admin-книга `.xlsm` для чтения и отчетов по логам. Ее не надо показывать обычным пользователям на вкладке `Аудиторам`.
 
-On open or manual refresh, it should:
+При открытии или ручном обновлении она должна:
 
-- scan `NetworkAssetsRoot\_system\activity-logs\computers\` for `.tsv` files;
-- import valid rows into `RawEvents`;
-- deduplicate by `EventId`;
-- ignore malformed rows, including a partially appended final row, and report them in `Diagnostics`;
-- rebuild derived tables and reports.
+- сканировать `NetworkAssetsRoot\_system\activity-logs\computers\` на `.tsv` файлы;
+- импортировать валидные строки в `RawEvents`;
+- убирать дубли по `EventId`;
+- игнорировать битые строки, включая частично дописанную последнюю строку, и показывать их в `Diagnostics`;
+- перестраивать расчетные таблицы и отчеты.
 
-The importer should treat the header as schema validation. Unknown extra columns may be ignored, but missing required columns should make that source file appear in `Diagnostics` rather than breaking refresh.
+Импортер должен проверять заголовок как схему. Неизвестные лишние колонки можно игнорировать, но если нет обязательных колонок, такой файл должен попасть в `Diagnostics`, а не ломать обновление.
 
-Suggested sheets:
+Предлагаемые листы:
 
-- `Dashboard`: high-level filters and summary metrics.
-- `RawEvents`: imported event stream.
-- `Sessions`: one row per inferred workbook open session.
-- `Files`: activity grouped by workbook path.
-- `Users`: activity grouped by Windows and Excel user.
-- `Computers`: freshness and event counts by machine.
-- `Diagnostics`: import status, skipped files, malformed rows, duplicate counts.
+- `Dashboard`: основные фильтры и сводные показатели.
+- `RawEvents`: импортированный поток событий.
+- `Sessions`: одна строка на предполагаемую сессию открытия книги.
+- `Files`: активность по путям книг.
+- `Users`: активность по Windows/Excel пользователям.
+- `Computers`: свежесть логов и количество событий по компьютерам.
+- `Diagnostics`: статус импорта, пропущенные файлы, битые строки, дубли.
 
-## Session Calculations
+## Расчет Сессий
 
-The central workbook calculates approximate open duration from the event stream:
+Центральная книга считает примерную длительность открытия по событиям:
 
-- `OpenedAt`: first `OPEN` for a `WorkbookSessionId`.
-- `LastSeenAt`: last `SEEN`, `SAVE`, or `OPEN` timestamp for the session.
-- `MissingAt`: first `MISSING` after the last seen state, when available.
-- `ApproxClosedAt`: `MissingAt` if present, otherwise `LastSeenAt`.
+- `OpenedAt`: первый `OPEN` для `WorkbookSessionId`.
+- `LastSeenAt`: последний `SEEN`, `SAVE` или `OPEN` для сессии.
+- `MissingAt`: первый `MISSING` после последнего видимого состояния, если есть.
+- `ApproxClosedAt`: `MissingAt`, если он есть, иначе `LastSeenAt`.
 - `OpenDurationMinutes`: `ApproxClosedAt - OpenedAt`.
 
-Because heartbeat is every 5 minutes by default, close time is approximate. This is intentional: it avoids risky close-time writes.
+Так как heartbeat по умолчанию раз в 5 минут, время закрытия приблизительное. Это намеренное ограничение: оно убирает риск тяжелой записи в момент закрытия Excel.
 
-## Reports and Macros
+## Отчеты И Макросы
 
-The central workbook should provide admin macros for:
+В центральной книге нужны admin-макросы:
 
-- refresh all logs;
-- show activity for a selected workbook path;
-- show activity by user for a selected period;
-- show files opened from a selected project folder;
-- calculate open duration by workbook session;
-- list files saved by multiple users;
-- list very long workbook sessions;
-- list computers whose logs have not updated recently;
-- export filtered results to a new `.xlsx`.
+- обновить все логи;
+- показать активность по выбранному пути книги;
+- показать активность пользователя за период;
+- показать файлы из выбранной папки проекта;
+- посчитать длительность открытия по сессиям;
+- показать файлы, которые сохраняли несколько пользователей;
+- показать очень долгие сессии открытия;
+- показать компьютеры, от которых давно не было логов;
+- выгрузить отфильтрованный результат в новый `.xlsx`.
 
-Useful default views:
+Полезные стандартные представления:
 
-- "Кто открывал этот файл?"
-- "Что открывал пользователь?"
-- "Сколько времени книга была открыта?"
-- "Последние активные книги по проекту"
-- "Файлы с несколькими пользователями"
-- "Диагностика установки логгера"
+- `Кто открывал этот файл?`
+- `Что открывал пользователь?`
+- `Сколько времени книга была открыта?`
+- `Последние активные книги по проекту`
+- `Файлы с несколькими пользователями`
+- `Диагностика установки логгера`
 
-## Failure Handling
+## Обработка Ошибок
 
-The runtime logger should treat logging as best-effort:
+Runtime-логгер должен считать логирование best-effort:
 
-- if local spool write fails, write only to `Debug.Print` and continue;
-- if network flush fails, keep local rows and retry later;
-- if a TSV is being read while another Excel appends to it, the central workbook should ignore a partial final row and import it on the next refresh;
-- if the network root is missing, the add-in should skip quickly;
-- no normal user workflow should wait on log reporting.
+- если запись в локальный spool не удалась, только `Debug.Print` и продолжить работу;
+- если выгрузка в сеть не удалась, оставить локальные строки и повторить позже;
+- если центральная книга читает TSV одновременно с дописыванием, она игнорирует частичную последнюю строку и импортирует ее при следующем обновлении;
+- если сетевой корень отсутствует, надстройка быстро пропускает выгрузку;
+- обычный пользовательский сценарий не должен ждать отчетность по логам.
 
-## Testing Strategy
+## Стратегия Тестирования
 
-Source-level checks:
+Source-level проверки:
 
-- no forbidden runtime markers in logger and viewer-support modules;
-- no delete/move/rename operations in runtime logging code;
-- `WorkbookBeforeClose` path does not open or save central workbooks;
-- timers use `ThisWorkbook.FullName` macro targets when needed;
-- activity logger is not exposed as normal user Ribbon controls.
+- нет запрещенных runtime-маркеров в модулях логгера и поддержки viewer-а;
+- нет операций delete/move/rename в runtime-коде логирования;
+- путь `WorkbookBeforeClose` не открывает и не сохраняет центральные книги;
+- таймеры, если используются, ссылаются через `ThisWorkbook.FullName`;
+- логгер не вынесен в обычные пользовательские Ribbon-кнопки.
 
-Runtime/COM smoke checks:
+Runtime/COM smoke-проверки:
 
-- open a saved workbook and verify local `OPEN`;
-- save workbook and verify local `SAVE`;
-- run heartbeat and verify `SEEN`;
-- close workbook and verify shutdown does not hang;
-- simulate unavailable network store and verify Excel continues;
-- flush to dev simulation folder and verify monthly per-computer TSV;
-- open central viewer and verify import, deduplication, sessions, and diagnostics.
+- открыть сохраненную книгу и проверить локальный `OPEN`;
+- сохранить книгу и проверить локальный `SAVE`;
+- запустить heartbeat и проверить `SEEN`;
+- закрыть книгу и проверить, что Excel не зависает;
+- сымитировать недоступное сетевое хранилище и проверить, что Excel продолжает работать;
+- выгрузить в dev-имитацию и проверить месячный TSV компьютера;
+- открыть центральную книгу и проверить импорт, дедупликацию, сессии и диагностику.
 
-Scale-oriented checks:
+Проверки на масштаб:
 
-- create sample TSV files for many computers and months;
-- verify central import performance remains acceptable;
-- verify duplicate `EventId` rows do not duplicate reports;
-- verify malformed/partial rows go to diagnostics instead of breaking refresh.
+- создать тестовые TSV-файлы для многих компьютеров и месяцев;
+- проверить, что центральный импорт остается приемлемым по скорости;
+- проверить, что повторные `EventId` не дублируют отчеты;
+- проверить, что битые или частичные строки попадают в диагностику, а не ломают обновление.
 
-## Open Decisions
+## Открытые Решения
 
-- Exact central viewer file name and location.
-- Whether the central viewer should be shipped as part of add-in assets or kept as an admin-only workbook outside the normal user package.
-- Exact hidden admin procedures for enabling/disabling runtime logging during rollout.
-- Whether heartbeat should be fixed at 5 minutes or configurable through a hidden admin setting.
+- Точное имя и место хранения центральной книги просмотра.
+- Поставлять ли центральную книгу как часть assets надстройки или держать отдельно как admin-only файл.
+- Точный набор скрытых admin-процедур для включения и отключения логгера во время rollout.
+- Heartbeat фиксированный на 5 минут или настраиваемый через скрытую admin-настройку.
