@@ -1,0 +1,8 @@
+# This workspace contains the canonical private repository as a nested Git repository.
+/_publish/audit-macros-private/
+
+# Required local build input; its canonical hash is checked by the add-in tests.
+/cbr_currency_2020_2026.xlsx
+
+# Office creates transient lock files beside opened documents.
+~$*
