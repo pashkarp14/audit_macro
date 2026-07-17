@@ -2,7 +2,7 @@
 
 Дата: 2026-07-17
 
-Статус: дизайн согласован в чате; ожидает документального ревью и плана реализации.
+Статус: дизайн согласован в чате и прошел ревью; единый Office-журнал согласован 2026-07-17 перед планом реализации.
 
 ## Контекст
 
@@ -20,12 +20,13 @@ Word-линия должна повторять проверенную схем�
 - Поддержать сетевые каналы `word-addin-dev`, `word-addin-testers`, `word-addin-stable` одним channel-agnostic пакетом.
 - Поддержать произвольный каталог Word-шаблонов через TSV-реестр.
 - Добавить скрытый Activity Logger с теми же типами действий, которые фактически отслеживает Excel-логгер.
+- Собирать Excel- и Word-события в одной admin-книге `!Журнал активности Office.xlsm`, не меняя Excel runtime и существующую Excel TSV-схему.
 - Сохранить fail-open запуск: локальный runtime загружается без сетевых вызовов; сетевые сервисы выполняют одну best-effort попытку и затем отдельный cooldown. Первый системный доступ к недоступному mapped drive может ждать Windows timeout — это явно раскрываемое и требующее подтверждения ограничение чистого VBA.
 - Сразу предусмотреть dev-сборку без VBA-пароля и отдельный company-пайплайн с VBA-защитой.
 
 ## Не Цели Первой Версии
 
-- Не менять `addin/`, `addin_updater/`, `AuditAddin.xlam`, Excel Ribbon, Excel Activity Logger или Excel admin-книгу.
+- Не менять `addin/`, `addin_updater/`, `AuditAddin.xlam`, Excel Ribbon, Excel Activity Logger, существующую Excel TSV-схему или исходники текущей `!Журнал активности Excel.xlsm`.
 - Не добавлять очистку текста, оформление таблиц, экспорт в PDF, проверку документа, инструкцию, конструктор РД или другие пользовательские команды.
 - Не добавлять видимую кнопку Activity Logger или дополнительные Ribbon-пункты.
 - Не записывать текст документов, нажатия клавиш, изменения текста, выделения, перемещения курсора, печать или содержимое буфера обмена.
@@ -131,9 +132,9 @@ AuditWordAddinSetup.dotm
 
 Поэтому конечные пользователи запускают Setup из фактической папки выбранного сетевого канала. Имя канала нужно только для диагностики; обновляющий код не содержит трех отдельных hardcoded-пакетов.
 
-## Сетевые Word-Ресурсы
+## Сетевые Ресурсы И Единый Office-Журнал
 
-Общий склад Word-ресурсов отделен от каналов runtime:
+Общий склад Word-шаблонов отделен от каналов runtime:
 
 ```text
 Z:\Project\DAVK\Оборудование\Addins\word-assets\
@@ -141,23 +142,31 @@ Z:\Project\DAVK\Оборудование\Addins\word-assets\
     <произвольная структура шаблонов>
   sync\
     word-rd-template-map.tsv
-  _system\
-    activity-logs\
-      computers\
-        <MachineName>__<WordSessionId>__YYYY-MM.tsv
-      logger-control.ini
-      !Журнал активности Word.xlsm
 ```
+
+Excel и Word используют общий административный корень журналов, уже расположенный внутри существующего Excel assets-root:
+
+```text
+Z:\Project\DAVK\Оборудование\Addins\assets\_system\activity-logs\
+  computers\
+    <MachineName>__YYYY-MM.tsv                 # существующие Excel-файлы без изменений
+  word-computers\
+    <MachineName>__<WordSessionId>__YYYY-MM.tsv
+  logger-control.ini                           # единое управление выгрузкой Excel и Word
+  !Журнал активности Excel.xlsm                # существующая legacy-книга остается как есть
+  !Журнал активности Office.xlsm               # новая единая admin-книга
+```
+
+Разные подпапки нужны для совместимости: текущая Excel admin-книга продолжает читать только `computers\`, а Word-файлы с другой схемой не попадают в ее diagnostics. Новая Office-книга читает обе подпапки и является основным объединенным представлением.
 
 Папка `templates\` может быть пустой в первой сборке. Ни количество шаблонов, ни их иерархия не являются частью контракта runtime. Сами измерения выбора `вид аудита -> этапность/вариант -> код РД` зафиксированы исходным пользовательским сценарием; динамическими остаются их значения и число шаблонов.
 
-Синхронизация работает по allowlist и в таком порядке:
+Синхронизация Word assets работает по allowlist и в таком порядке:
 
 1. рекурсивно копирует `templates\`;
-2. копирует `_system\activity-logs\logger-control.ini`;
-3. последним копирует `sync\word-rd-template-map.tsv`, чтобы новый каталог не ссылался на еще не скопированные шаблоны.
+2. последним копирует `sync\word-rd-template-map.tsv`, чтобы новый каталог не ссылался на еще не скопированные шаблоны.
 
-Никакие другие файлы `word-assets` в пользовательский кэш не попадают. В частности, не копируются `_system\activity-logs\computers\`, `!Журнал активности Word.xlsm` и чужие сетевые логи.
+Никакие другие файлы `word-assets` в пользовательский кэш не попадают. Отдельная activity-control sync копирует только общий `logger-control.ini` в локальный Word-кэш для диагностики. Она никогда не копирует `computers\`, `word-computers\`, legacy Excel viewer, Office viewer или чужие сетевые логи. Кэшированный control не является разрешением на выгрузку: решение принимается только по свежему сетевому файлу в той же activity-задаче.
 
 ## Локальные Пути
 
@@ -213,7 +222,7 @@ C:\Users\pavel\OneDrive\Рабочий стол\Релиз надстройки 
 
 Оно создается только при явном company-release и содержит актуальный комплект, результаты проверок и `На рабочий комп.zip`. Старые версии уходят в repo archive, а не накапливаются в зеркале рабочего стола.
 
-Word-assets публикуются отдельным asset/template-release и не смешиваются с обычным runtime-пакетом. Реальные шаблоны не создаются и не придумываются до их передачи Павлом.
+Word-assets публикуются отдельным asset/template-release и не смешиваются с обычным runtime-пакетом. Реальные шаблоны не создаются и не придумываются до их передачи Павлом. Единый Office viewer публикуется отдельным admin-activity release в общий `assets\_system\activity-logs` и не входит в пользовательский Word runtime zip без явной release-команды.
 
 ## Установка
 
@@ -228,7 +237,7 @@ Setup:
 5. валидирует source version и package до изменения Word Startup;
 6. при первой установке копирует runtime/version в слот `A`, проверяет копии и готовит его как active;
 7. при повторной установке копирует runtime/version в неактивный слот, проверяет копии и готовит его как pending;
-8. полностью записывает и перечитывает config с путями выбранного канала и Word assets;
+8. полностью записывает и перечитывает config с путями выбранного канала, Word assets и общего Office journal root;
 9. только после готового slot/config при первой установке копирует стабильный Loader protocol v1 как `AuditWordAddinLoaderLocal.dotm`; Loader является commit point установки;
 10. сообщает об успешной установке и необходимости перезапустить Word.
 
@@ -250,12 +259,14 @@ UpdateMode=Auto
 NetworkPackagePath=<channel>\Не трогать\AuditWordAddin.dotm
 NetworkVersionPath=<channel>\Не трогать\AuditWordAddin.version.txt
 NetworkAssetsRoot=Z:\Project\DAVK\Оборудование\Addins\word-assets
+NetworkActivityLogRoot=Z:\Project\DAVK\Оборудование\Addins\assets\_system\activity-logs
 LocalRuntimeRoot=%APPDATA%\AuditWordAddin\installed\slots
 ActiveRuntimeSlot=A|B
 PendingRuntimeSlot=A|B|
 LoaderProtocolVersion=1
 AssetsRoot=%APPDATA%\AuditWordAddin\assets
 RdTemplateRoot=%APPDATA%\AuditWordAddin\assets\templates
+LocalActivityLogControlPath=%APPDATA%\AuditWordAddin\assets\_system\activity-logs\logger-control.ini
 RuntimeRetryAfter=
 AssetsRetryAfter=
 ActivityLogRetryAfter=
@@ -265,6 +276,8 @@ LastAssetsSyncAt=
 ```
 
 В реальном файле переменные окружения раскрыты до абсолютных путей. Пустой или некорректный обязательный путь считается недоступным и не отправляется в FSO/Word API.
+
+Для локальной dev-имитации единый journal root указывает на `%APPDATA%\AuditAddin\assets\_system\activity-logs`: существующие Excel dev-логи остаются в `computers\`, а Word dev-логи попадают в `word-computers\`. Автотесты не используют реальные пользовательские логи и подставляют временный `NetworkActivityLogRoot`.
 
 ## Обновление При Старте Word
 
@@ -296,7 +309,15 @@ Runtime update task выполняется уже после появления 
 
 Таким образом, обновление Word runtime применяется с задержкой в один перезапуск. Незавершенное копирование затрагивает только неактивный слот и не уничтожает последнюю пригодную версию.
 
-Assets task имеет независимый `AssetsRetryAfter`, работает по allowlist и `DateLastModified`. Logger flush имеет независимый `ActivityLogRetryAfter`. Ошибка одного сетевого сервиса не отключает два других.
+Assets task имеет независимый `AssetsRetryAfter`, работает по allowlist и `DateLastModified`. Activity task имеет независимый `ActivityLogRetryAfter` и выполняет fail-closed протокол:
+
+1. проверяет готовность `NetworkActivityLogRoot`;
+2. читает и валидирует свежий сетевой `logger-control.ini`;
+3. обновляет локальную control-копию только для диагностики;
+4. вычисляет разрешение для текущей машины по свежему тексту;
+5. только при явном разрешении выгружает Word spool в `NetworkActivityLogRoot\word-computers`.
+
+Недоступный, пустой, битый или нечитабельный сетевой control запрещает текущую выгрузку. Устаревший локальный `UploadDefault=Yes` или machine allowlist никогда не разрешает flush. Ошибка одного сетевого сервиса не отключает два других.
 
 Отказ сети не является отказом Word-надстройки. Setup гарантирует наличие первоначального локального runtime. Если обновление не удалось, используется предыдущая локальная копия.
 
@@ -456,6 +477,7 @@ Enabled
 - сетевые package/version paths;
 - локальный runtime path;
 - `NetworkAssetsRoot`, `AssetsRoot`, `RdTemplateRoot`;
+- общий `NetworkActivityLogRoot`, локальный control-файл и Word network subfolder;
 - путь и статус `word-rd-template-map.tsv`;
 - количество активных, найденных и отсутствующих шаблонов;
 - состояние Activity Logger;
@@ -468,7 +490,7 @@ Enabled
 
 ## Activity Logger
 
-Activity Logger является скрытым best-effort сервисом. Он повторяет фактический уровень событий Excel-логгера, но использует Word-объекты и отдельное хранилище.
+Activity Logger является скрытым best-effort сервисом. Он повторяет фактический уровень событий Excel-логгера, использует Word-объекты и пишет отдельные source-файлы внутри общего Office-хранилища.
 
 Типы событий:
 
@@ -529,7 +551,23 @@ WriteReserved
 ReadOnlyRecommended
 ```
 
-Табы и переносы строк в полях заменяются пробелами. `EventId` уникален в пределах машины и сессии и используется admin-книгой для дедупликации.
+Табы и переносы строк в полях заменяются пробелами. Word `EventId` имеет формат `<MachineName>-WORD-<WordSessionId>-<Sequence6>` и уникален в пределах машины/Word-сессии.
+
+### Wire-Формат Логов И Control
+
+Контракт совместим с фактическим текущим Excel logger-ом:
+
+- ExcelV1 TSV: UTF-16LE с BOM, строки CRLF, tab-separated header/rows;
+- WordV1 TSV: UTF-16LE с BOM, строки CRLF, tab-separated header/rows;
+- `logger-control.ini`: UTF-16LE с BOM, строки CRLF, одна пара `Key=Value` на строку;
+- первая непустая строка TSV является header;
+- обязательные колонки определяются по имени без учета регистра, порядок известных колонок сохраняется исходным writer-ом;
+- частичная последняя строка без CRLF не импортируется до следующего refresh;
+- неизвестная кодировка или файл без поддерживаемого BOM попадают в diagnostics, а не читаются как ANSI.
+
+Office viewer обязательно auto-detect-ит UTF-16LE BOM. Для forward-compatible fixtures он также может читать UTF-8 BOM, но writers первой версии всегда создают UTF-16LE. Тестовый ExcelV1 fixture создается тем же Unicode FSO-контрактом, который использует текущий `addin/modActivityLogStore.bas`, а не вручную преобразованным UTF-8-текстом.
+
+Единая admin-книга дедуплицирует по ключу `OfficeApp + MachineName + EventId`. Ключ Office-сессии: `OfficeApp + MachineName + OfficeSessionId`; ключ document-сессии: `OfficeApp + MachineName + DocumentSessionId`. Collision-fixtures содержат одинаковые `EventId`/session id для разных приложений и машин и не должны склеиваться.
 
 ### Локальный Spool И Сеть
 
@@ -542,12 +580,12 @@ ReadOnlyRecommended
 `WordSessionId` содержит время старта и случайный discriminator. Поэтому два параллельных процесса Word не пишут в один локальный файл. Для каждого spool-файла sync-state отдельно хранит номер последней выгруженной строки. При доступности сети logger дописывает только новые строки в одноименный уникальный файл:
 
 ```text
-Z:\Project\DAVK\Оборудование\Addins\word-assets\_system\activity-logs\computers\<MachineName>__<WordSessionId>__YYYY-MM.tsv
+Z:\Project\DAVK\Оборудование\Addins\assets\_system\activity-logs\word-computers\<MachineName>__<WordSessionId>__YYYY-MM.tsv
 ```
 
 Каждая Word-сессия пишет только в свой месячный файл, поэтому между параллельными `WINWORD.EXE` нет shared append/state. Центральная admin-книга не открывается и не изменяется пользовательским runtime.
 
-`logger-control.ini` повторяет staged rollout Excel-логгера:
+Word читает тот же `logger-control.ini`, что и Excel, поэтому staged rollout централизован для обеих надстроек:
 
 ```text
 UploadDefault=No
@@ -569,37 +607,58 @@ UpdatedBy=
 
 Месячное разбиение позволяет позже добавить календарную retention-политику без смены схемы событий, но такая логика не входит в текущую реализацию.
 
-## Admin-Книга Word-Логов
+## Единая Admin-Книга Office-Логов
 
-Отдельная admin-only книга:
+Новая admin-only книга:
 
 ```text
-!Журнал активности Word.xlsm
+!Журнал активности Office.xlsm
 ```
 
-Она собирается из Word-линии исходников и не меняет `!Журнал активности Excel.xlsm`.
+Она собирается из исходников новой Word-линии и не меняет `!Журнал активности Excel.xlsm`, ее VBA или существующий Excel logger. Legacy Excel viewer может продолжать использоваться, но единая Office-книга становится основным отчетом.
 
-При открытии книга:
+При открытии Office-книга:
 
-- читает `activity-logs\computers\*.tsv`;
-- проверяет заголовки;
+- читает существующие Excel `activity-logs\computers\*.tsv`;
+- читает новые Word `activity-logs\word-computers\*.tsv`;
+- определяет приложение по source folder/schema, а не по имени документа;
+- проверяет заголовки отдельно для Excel и Word;
 - игнорирует и диагностирует битые/частично записанные строки;
-- убирает дубли по `EventId`;
-- строит raw events, document sessions, files, users, computers и diagnostics;
-- дает admin-контролы включения/выключения сетевой выгрузки.
+- убирает дубли по `OfficeApp + MachineName + EventId`;
+- нормализует события в общую модель;
+- строит raw events, office sessions, document sessions, files, users, computers и diagnostics;
+- дает единые admin-контролы `logger-control.ini`, влияющие на выгрузку обеих надстроек.
 
-Company-сборка admin-книги принимает пароль открытия параметром сборочного скрипта. Пароль не хранится в Git. До явного Word company-release достаточно реализовать исходники, builder и тесты; фактический защищенный viewer собирается только при передаче пароля или отдельной release-команде.
+Нормализованная модель добавляет `OfficeApp=Excel|Word`, `SourceSchema=ExcelV1|WordV1` и общие поля:
+
+```text
+OfficeSessionId
+DocumentSessionId
+DocumentName
+DocumentFullName
+DocumentFolder
+OfficeUser
+```
+
+Excel mapper переводит `ExcelSessionId`, `WorkbookSessionId`, `WorkbookName`, `WorkbookFullName`, `WorkbookFolder`, `ExcelUser` в общие поля. Word mapper переводит одноименные Word/Document-поля. Source-specific колонки `WriteReservedBy` и `WriteReserved` сохраняются раздельно в `RawEvents`, а общие отчеты используют нормализованный `OpenMode`.
+
+`Sessions` группирует строго по `OfficeApp + MachineName + OfficeSessionId`, а document sessions — по `OfficeApp + MachineName + DocumentSessionId`. Отчеты по файлам могут дополнительно агрегировать нормализованный полный путь между приложениями, но никогда не используют путь как идентификатор сессии.
+
+Все листы и фильтры Office-книги имеют измерение `OfficeApp`; можно смотреть оба приложения вместе либо только Excel/Word. Существующие Excel TSV не мигрируются и не переписываются.
+
+Company-сборка Office-книги принимает пароль открытия параметром сборочного скрипта. Пароль не хранится в Git. До явного company-release достаточно реализовать исходники, builder и тесты; фактический защищенный viewer собирается только при передаче пароля или отдельной release-команде.
 
 ## Модель Доступа К Сети
 
-Пути `word-addin-dev`, `word-addin-testers`, `word-addin-stable`, `word-assets` и desktop mirror придуманы рядом с Excel-линией и явно разрешены Павлом в этом обсуждении. Код надстройки не создает и не меняет NTFS/share ACL; права являются обязательной внешней предпосылкой company-публикации.
+Пути `word-addin-dev`, `word-addin-testers`, `word-addin-stable`, `word-assets`, общий `assets\_system\activity-logs` и desktop mirror явно разрешены Павлом в этом обсуждении. Код надстройки не создает и не меняет NTFS/share ACL; права являются обязательной внешней предпосылкой company-публикации.
 
 Рекомендуемая граница доверия:
 
 - обычные пользователи имеют только чтение channel package, `word-assets\templates` и `word-assets\sync`;
-- запись package, version, templates, registry и `logger-control.ini` разрешена только администраторам/издателям;
-- `!Журнал активности Word.xlsm` и чтение всех raw TSV доступны только администраторам/аудиторам;
-- на `activity-logs\computers` пользователям разрешены создание файла и запись данных без просмотра чужих файлов;
+- обычные пользователи имеют read-only доступ к общему `logger-control.ini`, а запись control разрешена только администраторам/издателям;
+- запись package, version, templates, registry и Office viewer разрешена только администраторам/издателям;
+- `!Журнал активности Office.xlsm` и чтение всех Excel/Word raw TSV доступны только администраторам/аудиторам;
+- на `activity-logs\computers` и `activity-logs\word-computers` пользователям разрешены создание файла и запись данных без просмотра чужих файлов;
 - `CREATOR OWNER` получает чтение/дозапись собственного session-файла, администраторы получают чтение всех файлов;
 - локальный `%APPDATA%\AuditWordAddin` доступен текущему Windows-пользователю.
 
@@ -671,6 +730,56 @@ Company build запускается только по явной команде
 6. архивирует предыдущий company-release;
 7. обновляет desktop mirror и zip.
 
+### Отдельный Release Office Activity Viewer
+
+Исходники единой книги находятся только в новой линии:
+
+```text
+word_addin/admin_activity_log/modOfficeActivityLogViewer.bas
+word_addin/admin_activity_log/ThisWorkbook.office-activity-log-viewer.txt
+```
+
+Dev builder:
+
+```text
+word_addin/build/build-office-activity-log-viewer.ps1
+```
+
+Обязательные параметры: `-ActivityLogRoot`, `-OutputPath`, `-OpenPassword`. Builder последовательно запускает локальный Excel COM, импортирует UTF-8 source через временную CP1251-копию, создает `.xlsm`, ставит пароль открытия и сохраняет результат. Пароль не пишется в Git, stdout или отчеты.
+
+Локальный dev output по явному запуску:
+
+```text
+word_addin/release/admin-activity/!Журнал активности Office.xlsm
+```
+
+Company publisher:
+
+```text
+word_addin/build/publish-office-activity-company-release.ps1
+```
+
+Он принимает `-OpenPassword` и `-VbaPassword`, собирает staging, ставит VBA protection, проверяет пароль открытия, импорт смешанных ExcelV1/WordV1 fixtures, package policy и отсутствие изменений в `addin/`, `addin_updater/`, `addin/admin_activity_log/` и legacy viewer. Только после PASS он обновляет:
+
+```text
+word_addin/release/office-activity-company/
+  Ресурсы для общего склада/
+    assets/_system/activity-logs/!Журнал активности Office.xlsm
+  Результаты проверок/
+
+word_addin/release/office-activity-company-archive/<version>/
+```
+
+В `Результаты проверок` сохраняются человекочитаемые отчеты по schema import, dedupe/collision fixtures, open password, VBA protection и package/source policy с временем прогона.
+
+При явном Office activity company-release актуальная папка `Ресурсы для общего склада` зеркалируется в:
+
+```text
+C:\Users\pavel\OneDrive\Рабочий стол\Релиз надстройки Аудиторам Word\Ресурсы для общего склада\
+```
+
+Скрипт не пишет на `Z:` автоматически. Администратор вручную копирует готовую книгу в общий `assets\_system\activity-logs`. Обычный Word company-release не запускает этот publisher и не включает Office viewer без прямой команды.
+
 ## Стратегия Тестирования
 
 ### Source-Level Feature Tests
@@ -682,6 +791,7 @@ Company build запускается только по явной команде
 - `diagnostics`: обязательные поля и безопасная обработка пустых путей;
 - `scheduler`: единственная точка `Application.OnTime`, queue/coalescing/self-heal и отсутствие независимых timer-ов;
 - `activity`: Word events, pending-save state machine, запрет file/network calls в `DocumentBeforeSave`, per-session monthly spool, sync-state, отсутствие retention/delete;
+- `office-activity-viewer`: UTF-16LE/UTF-8 BOM detection, обе TSV-схемы, mapping в общие поля, составные app/machine keys, collision fixtures, общий control-файл и отсутствие изменений legacy Excel viewer;
 - `setup-loader`: channel-relative paths, StartupPath, Loader-last commit point, dual-slot unload-before-fallback, version protocol, независимые cooldown и asset allowlist;
 - `source-policy`: запрещенные shell/network/delete/move-маркеры;
 - `build`: обязательные исходники, Ribbon XML, icons и release layout.
@@ -702,7 +812,10 @@ Company build запускается только по явной команде
 - проверить обычный Save, успешный Save As, отмененный Save As, повторные pending-save и закрытие до callback;
 - проверить конфликт/пропуск `OnTime` и self-heal при следующем Word event;
 - запустить две Word-сессии и убедиться, что они используют разные spool/network TSV;
-- проверить network flush в локальную имитацию и offline fallback;
+- проверить network flush в общий `activity-logs\word-computers`, свежий общий control и offline fallback;
+- проверить fail-closed при отсутствующем/битом сетевом control и устаревшем локальном `Yes`;
+- собрать Office viewer на смешанных UTF-16LE ExcelV1/WordV1 fixtures и проверить общий/раздельный фильтр `OfficeApp`;
+- проверить одинаковые EventId/session id между приложениями/машинами без ложного dedupe/merge;
 - закрыть automation Word без зависшего процесса или модального окна.
 
 Тесты фиксируют исходные PID, не закрывают пользовательские `WINWORD.EXE` и не продолжают destructive cleanup, если не могут доказать, какой процесс создали сами. Если локальная ручная установка требует перезапуска открытого Word, пользователь получает короткую просьбу закрыть его.
@@ -726,7 +839,7 @@ Company build запускается только по явной команде
 - ошибка runtime/version/config до commit point не оставляет новый Loader в Startup;
 - read-only Startup и macro-blocked Setup с понятной ошибкой без частичной установки;
 - asset sync по allowlist/`DateLastModified` без удаления и с каталогом последним;
-- исключение центральных Word-логов и admin-книги из пользовательского кэша.
+- исключение обеих папок raw logs, legacy Excel viewer и Office viewer из пользовательского кэша.
 
 ### Company Release Checks
 
@@ -735,6 +848,7 @@ Company build запускается только по явной команде
 - подтверждение VBA protection;
 - корректная структура `На рабочий комп\Не трогать`;
 - ручное подтверждение ACL для channel packages, assets, control и raw logs;
+- Office viewer читает текущие ExcelV1 и WordV1 fixtures без миграции Excel TSV;
 - человекочитаемые отчеты с временем проверки;
 - desktop mirror/zip только после успешных проверок.
 
@@ -747,7 +861,9 @@ Company build запускается только по явной команде
 - Настройки вида работают при открытии/закрытии и по команде, не помечая документ измененным.
 - Хоткеи назначаются только allowlist-командам и не меняют `Normal.dotm`.
 - Диагностика показывает runtime, Startup, channel, paths, catalog и logger status.
-- Activity Logger пишет отдельные Word TSV и не записывает содержимое документов.
+- Activity Logger пишет Word TSV в `word-computers` общего Office journal root и не записывает содержимое документов.
+- `!Журнал активности Office.xlsm` объединяет неизмененные Excel TSV и новые Word TSV с измерением `OfficeApp`.
+- Excel runtime, Excel logger, Excel TSV-схема и legacy `!Журнал активности Excel.xlsm` не изменены.
 - В Activity Logger отсутствует логика шестимесячной retention/очистки.
 - Setup/Loader поддерживают `dev`, `testers`, `stable`, dual-slot fallback и независимые cooldown.
 - Runtime остается работоспособным без сети.
